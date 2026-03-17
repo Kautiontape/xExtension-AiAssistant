@@ -1,0 +1,77 @@
+.ai-assistant-container {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	margin-bottom: 8px;
+	font-size: 13px;
+	flex-wrap: wrap;
+}
+
+.ai-score-badge {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-width: 24px;
+	height: 24px;
+	padding: 0 6px;
+	border-radius: 12px;
+	font-weight: bold;
+	font-size: 12px;
+	color: #fff;
+	cursor: help;
+	flex-shrink: 0;
+}
+
+.ai-score-high { background-color: #22c55e; }
+.ai-score-mid  { background-color: #eab308; }
+.ai-score-low  { background-color: #6b7280; }
+
+.ai-summary {
+	color: inherit;
+	opacity: 0.8;
+	font-style: italic;
+	font-size: 12px;
+	line-height: 1.4;
+}
+
+.ai-feedback-btn,
+.ai-summarize-btn {
+	background: none;
+	border: 1px solid currentColor;
+	border-radius: 4px;
+	color: inherit;
+	cursor: pointer;
+	font-size: 12px;
+	line-height: 1;
+	padding: 2px 6px;
+	opacity: 0.4;
+	transition: opacity 0.2s;
+	flex-shrink: 0;
+}
+
+.ai-feedback-btn:hover,
+.ai-summarize-btn:hover {
+	opacity: 1;
+}
+
+.ai-feedback-btn.confirmed {
+	opacity: 1;
+	border-color: #22c55e;
+	color: #22c55e;
+}
+
+.ai-scoring-spinner {
+	color: inherit;
+	opacity: 0.5;
+	font-size: 12px;
+	font-style: italic;
+}
+
+.ai-score-error {
+	color: #ef4444;
+	font-size: 12px;
+}
+
+.ai-score-pending {
+	min-height: 24px;
+}

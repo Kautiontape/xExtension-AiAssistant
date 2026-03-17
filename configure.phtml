@@ -1,0 +1,110 @@
+<?php
+/** @var AiAssistantExtension $this */
+$apiKey = $this->getUserConfigurationValue('api_key') ?? '';
+$profile = $this->getUserConfigurationValue('interest_profile') ?? '';
+$threshold = $this->getUserConfigurationValue('summary_threshold') ?: '7';
+$scoringModel = $this->getUserConfigurationValue('scoring_model') ?: 'claude-haiku-4-5-20251001';
+$summaryModel = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-20250514';
+$formAction = _url('extension', 'configure', 'e', $this->getName());
+$csrfToken = FreshRSS_Auth::csrfToken();
+?>
+
+<div class="panel panel-default">
+	<div class="panel-heading">
+		<h3>AI Assistant Settings</h3>
+	</div>
+	<div class="panel-body">
+		<form method="post" action="<?= $formAction ?>">
+			<input type="hidden" name="_csrf" value="<?= htmlspecialchars($csrfToken) ?>">
+
+			<div class="form-group">
+				<label for="api_key">Anthropic API Key</label>
+				<div style="display: flex; gap: 8px; align-items: start;">
+					<input type="password" id="api_key" name="api_key"
+						class="form-control" style="flex: 1;"
+						value="<?= htmlspecialchars($apiKey) ?>"
+						placeholder="sk-ant-...">
+					<button type="button" id="test-api-key" class="btn btn-default">Test</button>
+				</div>
+				<span id="api-key-result" style="margin-top: 4px; display: inline-block;"></span>
+			</div>
+
+			<div class="form-group">
+				<label for="summary_threshold">Auto-Summary Threshold</label>
+				<p class="help-block">
+					Articles scoring at or above this value are auto-summarized after scoring.
+				</p>
+				<input type="number" id="summary_threshold" name="summary_threshold"
+					class="form-control" style="width: 80px;"
+					min="1" max="10" value="<?= htmlspecialchars($threshold) ?>">
+			</div>
+
+			<div class="form-group">
+				<label for="scoring_model">Scoring Model</label>
+				<select id="scoring_model" name="scoring_model" class="form-control" style="width: auto;">
+					<option value="claude-haiku-4-5-20251001" <?= $scoringModel === 'claude-haiku-4-5-20251001' ? 'selected' : '' ?>>Claude Haiku 4.5</option>
+					<option value="claude-sonnet-4-20250514" <?= $scoringModel === 'claude-sonnet-4-20250514' ? 'selected' : '' ?>>Claude Sonnet 4</option>
+				</select>
+			</div>
+
+			<div class="form-group">
+				<label for="summary_model">Summary / Profile Model</label>
+				<select id="summary_model" name="summary_model" class="form-control" style="width: auto;">
+					<option value="claude-sonnet-4-20250514" <?= $summaryModel === 'claude-sonnet-4-20250514' ? 'selected' : '' ?>>Claude Sonnet 4</option>
+					<option value="claude-haiku-4-5-20251001" <?= $summaryModel === 'claude-haiku-4-5-20251001' ? 'selected' : '' ?>>Claude Haiku 4.5</option>
+				</select>
+			</div>
+
+			<div class="form-group">
+				<label for="interest_profile">Interest Profile</label>
+				<p class="help-block">
+					This text is sent as context for scoring and feedback. Edit directly or let it evolve via +/&minus; feedback on articles.
+				</p>
+				<textarea id="interest_profile" name="interest_profile"
+					class="form-control" rows="20"
+					style="font-family: monospace; tab-size: 4; width: 100%; box-sizing: border-box;"
+				><?= htmlspecialchars($profile) ?></textarea>
+			</div>
+
+			<button type="submit" class="btn btn-primary">Save Settings</button>
+		</form>
+	</div>
+</div>
+
+<script>
+document.getElementById('test-api-key').addEventListener('click', function() {
+	var btn = this;
+	var result = document.getElementById('api-key-result');
+	var apiKey = document.getElementById('api_key').value;
+	btn.disabled = true;
+	result.textContent = 'Testing...';
+	result.style.color = '';
+
+	var url = new URL(window.location.pathname, window.location.origin);
+	url.searchParams.set('c', 'extension');
+	url.searchParams.set('a', 'configure');
+	url.searchParams.set('e', 'AiAssistant');
+
+	fetch(url.toString(), {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+		body: new URLSearchParams({
+			ajax_action: 'test_api_key',
+			api_key: apiKey,
+			_csrf: '<?= htmlspecialchars($csrfToken) ?>'
+		})
+	})
+	.then(function(r) { return r.json(); })
+	.then(function(data) {
+		result.textContent = data.message;
+		result.style.color = data.status === 'ok' ? '#22c55e' : '#ef4444';
+	})
+	.catch(function() {
+		result.textContent = 'Request failed';
+		result.style.color = '#ef4444';
+	})
+	.finally(function() {
+		btn.disabled = false;
+	});
+});
+</script>

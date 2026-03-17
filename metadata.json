@@ -1,0 +1,8 @@
+{
+	"name": "AI Assistant",
+	"author": "Shawn",
+	"description": "AI-powered article scoring, summaries, and interest profile management using Claude.",
+	"version": "1.0",
+	"entrypoint": "AiAssistant",
+	"type": "user"
+}
