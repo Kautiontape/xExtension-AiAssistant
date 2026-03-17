@@ -87,11 +87,13 @@ class AiAssistantExtension extends Minz_Extension {
 
 		// Normal POST: save settings
 		if (Minz_Request::isPost()) {
-			$this->setUserConfiguration('api_key', Minz_Request::paramString('api_key'));
-			$this->setUserConfiguration('interest_profile', Minz_Request::paramString('interest_profile'));
-			$this->setUserConfiguration('summary_threshold', Minz_Request::paramString('summary_threshold'));
-			$this->setUserConfiguration('scoring_model', Minz_Request::paramString('scoring_model'));
-			$this->setUserConfiguration('summary_model', Minz_Request::paramString('summary_model'));
+			$config = $this->getUserConfiguration() ?: [];
+			$config['api_key'] = Minz_Request::paramString('api_key');
+			$config['interest_profile'] = Minz_Request::paramString('interest_profile');
+			$config['summary_threshold'] = Minz_Request::paramString('summary_threshold');
+			$config['scoring_model'] = Minz_Request::paramString('scoring_model');
+			$config['summary_model'] = Minz_Request::paramString('summary_model');
+			$this->setUserConfiguration($config);
 		}
 	}
 
@@ -343,7 +345,9 @@ class AiAssistantExtension extends Minz_Extension {
 		}
 
 		$newProfile = trim($newProfile);
-		$this->setUserConfiguration('interest_profile', $newProfile);
+		$config = $this->getUserConfiguration() ?: [];
+		$config['interest_profile'] = $newProfile;
+		$this->setUserConfiguration($config);
 
 		echo json_encode(['status' => 'ok', 'profile_changed' => true]);
 	}
