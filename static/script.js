@@ -48,7 +48,8 @@
 				if (data.status !== "ok" || !data.scores) {
 					console.error("AI scoring failed:", data.message);
 					pending.forEach(function (el) {
-						el.innerHTML = '<span class="ai-score-error">Score failed</span>';
+						el.innerHTML = '<span class="ai-score-error">Score failed</span>'
+							+ ' <button class="ai-retry-score-btn">Retry</button>';
 					});
 					return;
 				}
@@ -91,7 +92,8 @@
 			.catch(function (err) {
 				console.error("AI scoring request failed:", err);
 				pending.forEach(function (el) {
-					el.innerHTML = '<span class="ai-score-error">Score failed</span>';
+					el.innerHTML = '<span class="ai-score-error">Score failed</span>'
+						+ ' <button class="ai-retry-score-btn">Retry</button>';
 				});
 			});
 	}
@@ -177,6 +179,15 @@
 		scorePendingEntries();
 
 		document.addEventListener("click", function (e) {
+			var retryBtn = e.target.closest(".ai-retry-score-btn");
+			if (retryBtn) {
+				var container = retryBtn.closest(".ai-assistant-container");
+				container.classList.add("ai-score-pending");
+				container.innerHTML = "";
+				scorePendingEntries();
+				return;
+			}
+
 			var summarizeBtn = e.target.closest(".ai-summarize-btn");
 			if (summarizeBtn) {
 				handleSummarize(summarizeBtn);

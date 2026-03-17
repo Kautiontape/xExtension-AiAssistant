@@ -72,6 +72,16 @@
 	font-size: 12px;
 }
 
+.ai-retry-score-btn {
+	background: none;
+	border: 1px solid #ef4444;
+	border-radius: 4px;
+	color: #ef4444;
+	cursor: pointer;
+	font-size: 11px;
+	padding: 1px 6px;
+}
+
 .ai-score-pending {
 	min-height: 24px;
 }
