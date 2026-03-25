@@ -106,7 +106,8 @@
 			html += '<button class="ai-summarize-btn">Summarize</button>';
 		}
 
-		html += '<button class="ai-feedback-btn" data-dir="more" title="More like this">+</button>'
+		html += '<button class="ai-chat-btn">Chat</button>'
+			+ '<button class="ai-feedback-btn" data-dir="more" title="More like this">+</button>'
 			+ '<button class="ai-feedback-btn" data-dir="less" title="Less like this">&minus;</button>';
 
 		el.innerHTML = html;
@@ -236,6 +237,142 @@
 			});
 	}
 
+	// ── Chat modal ──────────────────────────────────────────────────────────
+
+	var chatOverlay = null;
+
+	function handleChat(btn) {
+		var container = btn.closest(".ai-assistant-container");
+		var entryId = container.dataset.entryId;
+
+		// Find article title from the entry
+		var article = container.closest(".flux, .item, article, [id^='flux_']");
+		var titleEl = article ? article.querySelector(".title, .item-title, h2 a, h1 a, a.title") : null;
+		var title = titleEl ? titleEl.textContent.trim() : "Article";
+
+		// Gather existing context from DOM
+		var summaryEl = container.querySelector(".ai-summary");
+		var detailEl = container.querySelector(".ai-detail");
+		var initialMessages = [];
+		if (summaryEl) {
+			initialMessages.push({ role: "assistant", content: "Summary: " + summaryEl.textContent });
+		}
+		if (detailEl) {
+			initialMessages.push({ role: "assistant", content: detailEl.textContent });
+		}
+
+		openChatModal(entryId, title, initialMessages);
+	}
+
+	function openChatModal(entryId, title, initialMessages) {
+		if (chatOverlay) chatOverlay.remove();
+
+		chatOverlay = document.createElement("div");
+		chatOverlay.className = "ai-chat-overlay";
+		chatOverlay.innerHTML =
+			'<div class="ai-chat-modal">'
+			+ '<div class="ai-chat-header">'
+			+ '<span class="ai-chat-title">' + escapeHtml(title) + '</span>'
+			+ '<div class="ai-chat-header-controls">'
+			+ '<select class="ai-chat-model">'
+			+ '<option value="claude-sonnet-4-6">Sonnet 4.6</option>'
+			+ '<option value="claude-haiku-4-5-20251001">Haiku 4.5</option>'
+			+ '</select>'
+			+ '<button class="ai-chat-close">&times;</button>'
+			+ '</div>'
+			+ '</div>'
+			+ '<div class="ai-chat-messages"></div>'
+			+ '<div class="ai-chat-input-bar">'
+			+ '<input type="text" class="ai-chat-input" placeholder="Ask about this article\u2026">'
+			+ '<button class="ai-chat-send">Send</button>'
+			+ '</div>'
+			+ '</div>';
+
+		document.body.appendChild(chatOverlay);
+
+		var messagesDiv = chatOverlay.querySelector(".ai-chat-messages");
+		var input = chatOverlay.querySelector(".ai-chat-input");
+		var sendBtn = chatOverlay.querySelector(".ai-chat-send");
+		var closeBtn = chatOverlay.querySelector(".ai-chat-close");
+		var modelSelect = chatOverlay.querySelector(".ai-chat-model");
+
+		// Show initial context messages
+		initialMessages.forEach(function (m) {
+			appendMessage(messagesDiv, m.role, m.content);
+		});
+
+		function send() {
+			var text = input.value.trim();
+			if (!text) return;
+
+			appendMessage(messagesDiv, "user", text);
+			input.value = "";
+			sendBtn.disabled = true;
+
+			var thinking = appendMessage(messagesDiv, "assistant", "Thinking\u2026");
+			thinking.classList.add("ai-chat-thinking");
+
+			ajaxPost("chat", {
+				entry_id: entryId,
+				message: text,
+				model: modelSelect.value,
+			})
+				.then(function (data) {
+					thinking.remove();
+					if (data.status === "ok" && data.response) {
+						appendMessage(messagesDiv, "assistant", data.response);
+					} else {
+						appendMessage(messagesDiv, "assistant", "Error: " + (data.message || "Request failed"));
+					}
+					sendBtn.disabled = false;
+					input.focus();
+				})
+				.catch(function () {
+					thinking.remove();
+					appendMessage(messagesDiv, "assistant", "Error: Request failed");
+					sendBtn.disabled = false;
+					input.focus();
+				});
+		}
+
+		sendBtn.addEventListener("click", send);
+		input.addEventListener("keydown", function (e) {
+			if (e.key === "Enter" && !e.shiftKey) {
+				e.preventDefault();
+				send();
+			}
+		});
+
+		closeBtn.addEventListener("click", closeChatModal);
+		chatOverlay.addEventListener("click", function (e) {
+			if (e.target === chatOverlay) closeChatModal();
+		});
+
+		input.focus();
+	}
+
+	function appendMessage(container, role, text) {
+		var div = document.createElement("div");
+		div.className = "ai-chat-msg ai-chat-msg-" + role;
+		div.innerHTML = formatChatMessage(text);
+		container.appendChild(div);
+		container.scrollTop = container.scrollHeight;
+		return div;
+	}
+
+	function formatChatMessage(text) {
+		var escaped = escapeHtml(text);
+		escaped = escaped.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+		return escaped.replace(/\n/g, "<br>");
+	}
+
+	function closeChatModal() {
+		if (chatOverlay) {
+			chatOverlay.remove();
+			chatOverlay = null;
+		}
+	}
+
 	// ── Event delegation ─────────────────────────────────────────────────────
 
 	document.addEventListener("DOMContentLoaded", function () {
@@ -248,6 +385,12 @@
 				container.classList.add("ai-score-pending");
 				container.innerHTML = "";
 				scorePendingEntries();
+				return;
+			}
+
+			var chatBtn = e.target.closest(".ai-chat-btn");
+			if (chatBtn) {
+				handleChat(chatBtn);
 				return;
 			}
 
@@ -273,6 +416,12 @@
 			if (feedbackBtn) {
 				handleFeedback(feedbackBtn);
 				return;
+			}
+		});
+
+		document.addEventListener("keydown", function (e) {
+			if (e.key === "Escape" && chatOverlay) {
+				closeChatModal();
 			}
 		});
 	});

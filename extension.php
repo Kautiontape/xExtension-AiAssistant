@@ -74,8 +74,9 @@ class AiAssistantExtension extends Minz_Extension {
 			$html .= '<button class="ai-summarize-btn">Summarize</button>';
 		}
 
-		// Feedback buttons
-		$html .= '<button class="ai-feedback-btn" data-dir="more" title="More like this">+</button>'
+		// Chat + Feedback buttons
+		$html .= '<button class="ai-chat-btn">Chat</button>'
+			. '<button class="ai-feedback-btn" data-dir="more" title="More like this">+</button>'
 			. '<button class="ai-feedback-btn" data-dir="less" title="Less like this">&minus;</button>'
 			. '</div>';
 
@@ -216,6 +217,9 @@ class AiAssistantExtension extends Minz_Extension {
 				break;
 			case 'feedback':
 				$this->ajaxFeedback();
+				break;
+			case 'chat':
+				$this->ajaxChat();
 				break;
 			case 'test_api_key':
 				$this->ajaxTestApiKey();
@@ -586,9 +590,101 @@ class AiAssistantExtension extends Minz_Extension {
 		echo json_encode(['status' => 'ok', 'profile' => $profile]);
 	}
 
+	// ── Chat ────────────────────────────────────────────────────────────────
+
+	private function ajaxChat(): void {
+		$entryId = self::jsonParam('entry_id');
+		$message = self::jsonParam('message');
+		$model = self::jsonParam('model');
+
+		if (!$entryId || !$message) {
+			echo json_encode(['status' => 'error', 'message' => 'Missing entry_id or message']);
+			return;
+		}
+
+		$apiKey = $this->getUserConfigurationValue('api_key');
+		if (!$model) {
+			$model = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-6';
+		}
+
+		if (!$apiKey) {
+			echo json_encode(['status' => 'error', 'message' => 'No API key configured']);
+			return;
+		}
+
+		$entryDAO = FreshRSS_Factory::createEntryDao();
+		$entry = $entryDAO->searchById($entryId);
+		if (!$entry) {
+			echo json_encode(['status' => 'error', 'message' => 'Entry not found']);
+			return;
+		}
+
+		$profile = $this->getUserConfigurationValue('interest_profile');
+		$content = mb_substr(strip_tags($entry->content()), 0, 6000);
+		$title = $entry->title();
+		$source = $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown';
+		$summary = $entry->attributes()['ai_summary'] ?? '';
+		$detail = $entry->attributes()['ai_detail'] ?? '';
+
+		// Build system prompt with article context
+		$system = "You are a research assistant helping a reader understand an article.\n\n"
+			. "Article: {$title}\nSource: {$source}\n\n"
+			. "<article_content>\n{$content}\n</article_content>";
+
+		if ($profile) {
+			$system .= "\n\n<reader_interests>\n{$profile}\n</reader_interests>";
+		}
+		if ($summary) {
+			$system .= "\n\nPrevious summary: {$summary}";
+		}
+		if ($detail) {
+			$system .= "\n\nPrevious detail breakdown:\n{$detail}";
+		}
+
+		$system .= "\n\nAnswer questions about this article. Be concise and direct.";
+
+		// Load existing chat history
+		$chatHistory = $entry->attributes()['ai_chat'] ?? [];
+		if (!is_array($chatHistory)) {
+			$chatHistory = [];
+		}
+
+		// Build messages array: prior turns + new message
+		$messages = [];
+		foreach ($chatHistory as $turn) {
+			$messages[] = ['role' => $turn['role'], 'content' => $turn['content']];
+		}
+		$messages[] = ['role' => 'user', 'content' => $message];
+
+		$response = $this->callClaudeMessages($apiKey, $model, $system, $messages, 1500);
+		if ($response === null) {
+			echo json_encode(['status' => 'error', 'message' => 'Claude API call failed']);
+			return;
+		}
+
+		$response = trim($response);
+
+		// Append to chat history and save
+		$chatHistory[] = ['role' => 'user', 'content' => $message];
+		$chatHistory[] = ['role' => 'assistant', 'content' => $response];
+		$entry->_attribute('ai_chat', $chatHistory);
+		$entryDAO->updateEntry($entry->toArray());
+
+		echo json_encode(['status' => 'ok', 'response' => $response, 'history' => $chatHistory]);
+	}
+
 	// ── Claude API ───────────────────────────────────────────────────────────
 
-	private function callClaude(string $apiKey, string $model, string $prompt, int $maxTokens): ?string {
+	private function callClaudeMessages(string $apiKey, string $model, string $system, array $messages, int $maxTokens): ?string {
+		$body = [
+			'model' => $model,
+			'max_tokens' => $maxTokens,
+			'messages' => $messages,
+		];
+		if ($system !== '') {
+			$body['system'] = $system;
+		}
+
 		$ch = curl_init('https://api.anthropic.com/v1/messages');
 		curl_setopt_array($ch, [
 			CURLOPT_POST => true,
@@ -597,11 +693,7 @@ class AiAssistantExtension extends Minz_Extension {
 				'x-api-key: ' . $apiKey,
 				'anthropic-version: 2023-06-01',
 			],
-			CURLOPT_POSTFIELDS => json_encode([
-				'model' => $model,
-				'max_tokens' => $maxTokens,
-				'messages' => [['role' => 'user', 'content' => $prompt]],
-			]),
+			CURLOPT_POSTFIELDS => json_encode($body),
 			CURLOPT_RETURNTRANSFER => true,
 			CURLOPT_TIMEOUT => 60,
 		]);
@@ -617,6 +709,10 @@ class AiAssistantExtension extends Minz_Extension {
 
 		$data = json_decode($response, true);
 		return $data['content'][0]['text'] ?? null;
+	}
+
+	private function callClaude(string $apiKey, string $model, string $prompt, int $maxTokens): ?string {
+		return $this->callClaudeMessages($apiKey, $model, '', [['role' => 'user', 'content' => $prompt]], $maxTokens);
 	}
 
 	private function parseJsonResponse(string $text): ?array {
