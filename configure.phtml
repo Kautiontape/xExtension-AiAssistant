@@ -61,6 +61,7 @@ $csrfToken = FreshRSS_Auth::csrfToken();
 					<strong>Score</strong> — checked feeds get AI-scored. Unchecked feeds skip all scoring logic.<br>
 					<strong>Summarize</strong> — checked feeds always get summarized, regardless of score.
 				</p>
+				<?php foreach ($this->categories as $c) { ?>
 				<table class="table table-condensed" style="margin-bottom: 4px;">
 					<thead>
 						<tr>
@@ -73,7 +74,7 @@ $csrfToken = FreshRSS_Auth::csrfToken();
 							<th></th>
 						</tr>
 					</thead>
-					<?php foreach ($this->categories as $c) { ?>
+					<tbody>
 						<tr>
 							<td style="text-align: center;">
 								<input type="checkbox"
@@ -89,7 +90,7 @@ $csrfToken = FreshRSS_Auth::csrfToken();
 									value="1"
 									<?= $this->getSummarizeCategory($c->id()) ? 'checked' : '' ?>>
 							</td>
-							<td><strong><label for="score_cat_<?= $c->id() ?>"><?= htmlspecialchars($c->name()) ?> (whole category)</label></strong></td>
+							<td><strong><label for="score_cat_<?= $c->id() ?>"><?= htmlspecialchars($c->name()) ?></label></strong></td>
 						</tr>
 						<?php foreach ($c->feeds() as $f) { ?>
 							<tr>
@@ -110,8 +111,9 @@ $csrfToken = FreshRSS_Auth::csrfToken();
 								<td style="padding-left: 20px;"><label for="score_feed_<?= $f->id() ?>"><?= htmlspecialchars($f->name()) ?></label></td>
 							</tr>
 						<?php } ?>
-					<?php } ?>
+					</tbody>
 				</table>
+				<?php } ?>
 			</div>
 
 			<div class="form-group">
