@@ -641,7 +641,10 @@ class AiAssistantExtension extends Minz_Extension {
 			$system .= "\n\nPrevious detail breakdown:\n{$detail}";
 		}
 
-		$system .= "\n\nAnswer questions about this article. Be concise and direct.";
+		$system .= "\n\nAnswer questions about this article. Start with what the article says. "
+			. "If the article doesn't fully answer the question, supplement with your own knowledge "
+			. "or search the web — but clearly note when you're going beyond the article's content. "
+			. "Be concise and direct.";
 
 		// Load existing chat history
 		$chatHistory = $entry->attributes()['ai_chat'] ?? [];
@@ -656,7 +659,7 @@ class AiAssistantExtension extends Minz_Extension {
 		}
 		$messages[] = ['role' => 'user', 'content' => $message];
 
-		$response = $this->callClaudeMessages($apiKey, $model, $system, $messages, 1500);
+		$response = $this->callClaudeMessages($apiKey, $model, $system, $messages, 1500, true);
 		if ($response === null) {
 			echo json_encode(['status' => 'error', 'message' => 'Claude API call failed']);
 			return;
@@ -675,7 +678,7 @@ class AiAssistantExtension extends Minz_Extension {
 
 	// ── Claude API ───────────────────────────────────────────────────────────
 
-	private function callClaudeMessages(string $apiKey, string $model, string $system, array $messages, int $maxTokens): ?string {
+	private function callClaudeMessages(string $apiKey, string $model, string $system, array $messages, int $maxTokens, bool $webSearch = false): ?string {
 		$body = [
 			'model' => $model,
 			'max_tokens' => $maxTokens,
@@ -683,6 +686,11 @@ class AiAssistantExtension extends Minz_Extension {
 		];
 		if ($system !== '') {
 			$body['system'] = $system;
+		}
+		if ($webSearch) {
+			$body['tools'] = [
+				['type' => 'web_search_20250305', 'name' => 'web_search', 'max_uses' => 3],
+			];
 		}
 
 		$ch = curl_init('https://api.anthropic.com/v1/messages');
@@ -695,7 +703,7 @@ class AiAssistantExtension extends Minz_Extension {
 			],
 			CURLOPT_POSTFIELDS => json_encode($body),
 			CURLOPT_RETURNTRANSFER => true,
-			CURLOPT_TIMEOUT => 60,
+			CURLOPT_TIMEOUT => 90,
 		]);
 
 		$response = curl_exec($ch);
@@ -708,7 +716,15 @@ class AiAssistantExtension extends Minz_Extension {
 		}
 
 		$data = json_decode($response, true);
-		return $data['content'][0]['text'] ?? null;
+
+		// With tools, response has multiple content blocks — extract all text
+		$text = '';
+		foreach ($data['content'] ?? [] as $block) {
+			if (($block['type'] ?? '') === 'text') {
+				$text .= $block['text'];
+			}
+		}
+		return $text ?: null;
 	}
 
 	private function callClaude(string $apiKey, string $model, string $prompt, int $maxTokens): ?string {
