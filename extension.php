@@ -182,6 +182,98 @@ class AiAssistantExtension extends Minz_Extension {
 		return is_array($decoded) ? $decoded : [];
 	}
 
+	// ── YouTube helpers ──────────────────────────────────────────────────
+
+	private function extractYoutubeVideoId(string $url): ?string {
+		// youtube.com/watch?v=ID, youtu.be/ID, youtube.com/shorts/ID
+		if (preg_match('/(?:youtube\.com\/watch\?.*v=|youtu\.be\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/', $url, $m)) {
+			return $m[1];
+		}
+		return null;
+	}
+
+	private function fetchYoutubeInfo(string $videoId): ?array {
+		$url = 'http://youtube-helper:8000/video-info?v=' . urlencode($videoId);
+		$ch = curl_init($url);
+		curl_setopt_array($ch, [
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_TIMEOUT => 15,
+		]);
+		$response = curl_exec($ch);
+		$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		curl_close($ch);
+
+		if ($httpCode !== 200 || !$response) {
+			Minz_Log::warning("AiAssistant: youtube-helper error (HTTP {$httpCode}) for {$videoId}");
+			return null;
+		}
+
+		$data = json_decode($response, true);
+		return is_array($data) ? $data : null;
+	}
+
+	/**
+	 * Get transcript for an entry, fetching from youtube-helper if not cached.
+	 * Returns the transcript text or null.
+	 */
+	private function getYoutubeTranscript(FreshRSS_Entry $entry, $entryDAO = null): ?string {
+		$cached = $entry->attributes()['yt_transcript'] ?? null;
+		if ($cached !== null) {
+			return $cached ?: null;
+		}
+
+		$videoId = $this->extractYoutubeVideoId($entry->link());
+		if (!$videoId) return null;
+
+		$info = $this->fetchYoutubeInfo($videoId);
+		if (!$info) return null;
+
+		// Shorts: mark and skip
+		if (!empty($info['is_short'])) {
+			$entry->_attribute('yt_is_short', true);
+			$entry->_attribute('yt_duration', $info['duration']);
+			$entry->_attribute('yt_transcript', '');
+			$entry->_attribute('ai_score', 0);
+			$entry->_attribute('ai_score_reason', 'YouTube Short (filtered)');
+			$entry->_attribute('ai_needs_scoring', null);
+			$entry->_isRead(true);
+			if ($entryDAO) {
+				$entryDAO->updateEntry($entry->toArray());
+			}
+			return null;
+		}
+
+		$transcript = $info['transcript'] ?? null;
+		$entry->_attribute('yt_duration', $info['duration']);
+		$entry->_attribute('yt_transcript', $transcript ?: '');
+		if ($entryDAO) {
+			$entryDAO->updateEntry($entry->toArray());
+		}
+
+		return $transcript;
+	}
+
+	/**
+	 * Get the best available content for an entry (transcript for YouTube, stripped HTML otherwise).
+	 */
+	private function getEntryContent(FreshRSS_Entry $entry, int $maxChars, $entryDAO = null): string {
+		$videoId = $this->extractYoutubeVideoId($entry->link());
+		if ($videoId) {
+			$transcript = $this->getYoutubeTranscript($entry, $entryDAO);
+			if ($transcript) {
+				return mb_substr($transcript, 0, $maxChars);
+			}
+		}
+		return mb_substr(strip_tags($entry->content()), 0, $maxChars);
+	}
+
+	/**
+	 * Check if an entry is a YouTube video.
+	 */
+	private function isYoutube(FreshRSS_Entry $entry): bool {
+		return $this->extractYoutubeVideoId($entry->link()) !== null;
+	}
+
 	private function shouldScore(FreshRSS_Entry $entry): bool {
 		$feedId = $entry->feedId();
 		$feed = $entry->feed(false);
@@ -261,9 +353,33 @@ class AiAssistantExtension extends Minz_Extension {
 		$entries = [];
 		$articlesForPrompt = [];
 
+		$shortResults = [];
 		foreach ($entryIds as $id) {
 			$entry = $entryDAO->searchById($id);
-			if ($entry) {
+			if (!$entry) continue;
+
+			// For YouTube entries, fetch transcript and filter Shorts
+			if ($this->isYoutube($entry)) {
+				$transcript = $this->getYoutubeTranscript($entry, $entryDAO);
+				// Shorts get auto-filtered inside getYoutubeTranscript
+				if (!empty($entry->attributes()['yt_is_short'])) {
+					$shortResults[] = [
+						'id' => $id,
+						'score' => 0,
+						'reason' => 'YouTube Short (filtered)',
+					];
+					continue;
+				}
+				$entries[$id] = $entry;
+				$articlesForPrompt[] = [
+					'id' => $id,
+					'title' => $entry->title(),
+					'source' => $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown',
+					'summary' => $transcript
+						? mb_substr($transcript, 0, 500)
+						: mb_substr(strip_tags($entry->content()), 0, 300),
+				];
+			} else {
 				$entries[$id] = $entry;
 				$articlesForPrompt[] = [
 					'id' => $id,
@@ -275,14 +391,16 @@ class AiAssistantExtension extends Minz_Extension {
 		}
 
 		if (empty($articlesForPrompt)) {
-			echo json_encode(['status' => 'ok', 'scores' => []]);
+			echo json_encode(['status' => 'ok', 'scores' => $shortResults]);
 			return;
 		}
 
-		$prompt = "Score these articles for relevance based on the interest profile below.\n\n"
+		$prompt = "Score these articles/videos for relevance based on the interest profile below.\n\n"
 			. "<interest_profile>\n{$profile}\n</interest_profile>\n\n"
 			. "<articles>\n" . json_encode($articlesForPrompt, JSON_PRETTY_PRINT) . "\n</articles>\n\n"
-			. "For each article, return a JSON array of objects with:\n"
+			. "For YouTube videos, the summary comes from the video's auto-generated transcript. "
+			. "Score based on actual content, not just the title.\n\n"
+			. "For each item, return a JSON array of objects with:\n"
 			. "- \"id\": the article id (string)\n"
 			. "- \"score\": 1-10 relevance score (10 = must read, 1 = irrelevant)\n"
 			. "- \"reason\": one sentence explaining the score\n\n"
@@ -337,21 +455,23 @@ class AiAssistantExtension extends Minz_Extension {
 			$this->autoSummarize($apiKey, $summaryModel, $summaryEntries, $entryDAO, $results);
 		}
 
-		echo json_encode(['status' => 'ok', 'scores' => $results]);
+		echo json_encode(['status' => 'ok', 'scores' => array_merge($shortResults, $results)]);
 	}
 
 	// ── Summary generation (shared) ─────────────────────────────────────────
 
 	private function generateSummary(string $apiKey, string $model, FreshRSS_Entry $entry): ?string {
 		$profile = $this->getUserConfigurationValue('interest_profile');
-		$content = mb_substr(strip_tags($entry->content()), 0, 3000);
+		$content = $this->getEntryContent($entry, 3000);
 		$title = $entry->title();
 		$source = $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown';
+		$isVideo = $this->isYoutube($entry);
+		$contentType = $isVideo ? 'YouTube video (from transcript)' : 'article';
 
 		$prompt = "You are a research assistant for a reader with these interests:\n\n"
 			. "<interest_profile>\n{$profile}\n</interest_profile>\n\n"
-			. "Summarize this article — what it covers and what parts connect to the reader's interests.\n"
-			. "Focus on what the reader might find useful or interesting. Don't judge whether the article is worth reading.\n"
+			. "Summarize this {$contentType} — what it covers and what parts connect to the reader's interests.\n"
+			. "Focus on what the reader might find useful or interesting. Don't judge whether it is worth reading.\n"
 			. "Be direct. 1-3 sentences.\n\n"
 			. "Title: {$title}\nSource: {$source}\n\nContent:\n{$content}\n\n"
 			. "Return ONLY the summary, no quotes, no prefix.";
@@ -448,11 +568,13 @@ class AiAssistantExtension extends Minz_Extension {
 		}
 
 		$profile = $this->getUserConfigurationValue('interest_profile');
-		$content = mb_substr(strip_tags($entry->content()), 0, 6000);
+		$content = $this->getEntryContent($entry, 6000, $entryDAO);
 		$title = $entry->title();
 		$source = $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown';
+		$isVideo = $this->isYoutube($entry);
+		$contentType = $isVideo ? 'YouTube video (from transcript)' : 'article';
 
-		$prompt = "Break down this article for a reader with these interests:\n\n"
+		$prompt = "Break down this {$contentType} for a reader with these interests:\n\n"
 			. "<interest_profile>\n{$profile}\n</interest_profile>\n\n"
 			. "Provide a structured breakdown in 3-6 sections. Each section gets a bold\n"
 			. "subtitle and 1-2 sentences of detail. Spend more time on sections relevant\n"
@@ -625,16 +747,19 @@ class AiAssistantExtension extends Minz_Extension {
 		}
 
 		$profile = $this->getUserConfigurationValue('interest_profile');
-		$content = mb_substr(strip_tags($entry->content()), 0, 6000);
+		$content = $this->getEntryContent($entry, 6000, $entryDAO);
 		$title = $entry->title();
 		$source = $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown';
 		$summary = $entry->attributes()['ai_summary'] ?? '';
 		$detail = $entry->attributes()['ai_detail'] ?? '';
+		$isVideo = $this->isYoutube($entry);
+		$contentType = $isVideo ? 'YouTube video' : 'article';
+		$contentTag = $isVideo ? 'video_transcript' : 'article_content';
 
-		// Build system prompt with article context
-		$system = "You are a research assistant helping a reader understand an article.\n\n"
-			. "Article: {$title}\nSource: {$source}\n\n"
-			. "<article_content>\n{$content}\n</article_content>";
+		// Build system prompt with article/video context
+		$system = "You are a research assistant helping a reader understand a {$contentType}.\n\n"
+			. "{$contentType}: {$title}\nSource: {$source}\n\n"
+			. "<{$contentTag}>\n{$content}\n</{$contentTag}>";
 
 		if ($profile) {
 			$system .= "\n\n<reader_interests>\n{$profile}\n</reader_interests>";
@@ -646,9 +771,9 @@ class AiAssistantExtension extends Minz_Extension {
 			$system .= "\n\nPrevious detail breakdown:\n{$detail}";
 		}
 
-		$system .= "\n\nAnswer questions about this article. Start with what the article says. "
-			. "If the article doesn't fully answer the question, supplement with your own knowledge "
-			. "or search the web — but clearly note when you're going beyond the article's content. "
+		$system .= "\n\nAnswer questions about this {$contentType}. Start with what the content says. "
+			. "If the content doesn't fully answer the question, supplement with your own knowledge "
+			. "or search the web — but clearly note when you're going beyond the source material. "
 			. "Be concise and direct.";
 
 		// Load existing chat history
