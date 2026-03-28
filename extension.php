@@ -197,6 +197,7 @@ class AiAssistantExtension extends Minz_Extension {
 		$ch = curl_init($url);
 		curl_setopt_array($ch, [
 			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_CONNECTTIMEOUT => 2,
 			CURLOPT_TIMEOUT => 15,
 		]);
 		$response = curl_exec($ch);
@@ -217,6 +218,11 @@ class AiAssistantExtension extends Minz_Extension {
 	 * Returns the transcript text or null.
 	 */
 	private function getYoutubeTranscript(FreshRSS_Entry $entry, $entryDAO = null): ?string {
+		// Shorts have no useful transcript
+		if ($this->isYoutubeShort($entry)) {
+			return null;
+		}
+
 		$cached = $entry->attributes()['yt_transcript'] ?? null;
 		if ($cached !== null) {
 			return $cached ?: null;
@@ -227,21 +233,6 @@ class AiAssistantExtension extends Minz_Extension {
 
 		$info = $this->fetchYoutubeInfo($videoId);
 		if (!$info) return null;
-
-		// Shorts: mark and skip
-		if (!empty($info['is_short'])) {
-			$entry->_attribute('yt_is_short', true);
-			$entry->_attribute('yt_duration', $info['duration']);
-			$entry->_attribute('yt_transcript', '');
-			$entry->_attribute('ai_score', 0);
-			$entry->_attribute('ai_score_reason', 'YouTube Short (filtered)');
-			$entry->_attribute('ai_needs_scoring', null);
-			$entry->_isRead(true);
-			if ($entryDAO) {
-				$entryDAO->updateEntry($entry->toArray());
-			}
-			return null;
-		}
 
 		$transcript = $info['transcript'] ?? null;
 		$entry->_attribute('yt_duration', $info['duration']);
@@ -272,6 +263,13 @@ class AiAssistantExtension extends Minz_Extension {
 	 */
 	private function isYoutube(FreshRSS_Entry $entry): bool {
 		return $this->extractYoutubeVideoId($entry->link()) !== null;
+	}
+
+	/**
+	 * Check if an entry is a YouTube Short (by URL pattern).
+	 */
+	private function isYoutubeShort(FreshRSS_Entry $entry): bool {
+		return str_contains($entry->link(), 'youtube.com/shorts/');
 	}
 
 	private function shouldScore(FreshRSS_Entry $entry): bool {
@@ -358,18 +356,25 @@ class AiAssistantExtension extends Minz_Extension {
 			$entry = $entryDAO->searchById($id);
 			if (!$entry) continue;
 
-			// For YouTube entries, fetch transcript and filter Shorts
+			// Filter YouTube Shorts by URL (no need to call youtube-helper)
+			if ($this->isYoutubeShort($entry)) {
+				$entry->_attribute('yt_is_short', true);
+				$entry->_attribute('ai_score', 0);
+				$entry->_attribute('ai_score_reason', 'YouTube Short (filtered)');
+				$entry->_attribute('ai_needs_scoring', null);
+				$entry->_isRead(true);
+				$entryDAO->updateEntry($entry->toArray());
+				$shortResults[] = [
+					'id' => $id,
+					'score' => 0,
+					'reason' => 'YouTube Short (filtered)',
+				];
+				continue;
+			}
+
+			// For non-Short YouTube entries, fetch transcript
 			if ($this->isYoutube($entry)) {
 				$transcript = $this->getYoutubeTranscript($entry, $entryDAO);
-				// Shorts get auto-filtered inside getYoutubeTranscript
-				if (!empty($entry->attributes()['yt_is_short'])) {
-					$shortResults[] = [
-						'id' => $id,
-						'score' => 0,
-						'reason' => 'YouTube Short (filtered)',
-					];
-					continue;
-				}
 				$entries[$id] = $entry;
 				$articlesForPrompt[] = [
 					'id' => $id,
