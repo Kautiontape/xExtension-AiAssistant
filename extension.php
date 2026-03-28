@@ -297,7 +297,11 @@ class AiAssistantExtension extends Minz_Extension {
 	// ── AJAX handlers ────────────────────────────────────────────────────────
 
 	private function handleAjax(string $action): void {
-		header('Content-Type: application/json');
+		// Streaming actions set their own headers; default to JSON for the rest
+		$streamingActions = ['summarize', 'detail', 'chat'];
+		if (!in_array($action, $streamingActions, true)) {
+			header('Content-Type: application/json');
+		}
 
 		switch ($action) {
 			case 'score_batch':
@@ -465,7 +469,7 @@ class AiAssistantExtension extends Minz_Extension {
 
 	// ── Summary generation (shared) ─────────────────────────────────────────
 
-	private function generateSummary(string $apiKey, string $model, FreshRSS_Entry $entry): ?string {
+	private function buildSummaryPrompt(FreshRSS_Entry $entry): string {
 		$profile = $this->getUserConfigurationValue('interest_profile');
 		$content = $this->getEntryContent($entry, 3000);
 		$title = $entry->title();
@@ -473,14 +477,17 @@ class AiAssistantExtension extends Minz_Extension {
 		$isVideo = $this->isYoutube($entry);
 		$contentType = $isVideo ? 'YouTube video (from transcript)' : 'article';
 
-		$prompt = "You are a research assistant for a reader with these interests:\n\n"
+		return "You are a research assistant for a reader with these interests:\n\n"
 			. "<interest_profile>\n{$profile}\n</interest_profile>\n\n"
 			. "Summarize this {$contentType} — what it covers and what parts connect to the reader's interests.\n"
 			. "Focus on what the reader might find useful or interesting. Don't judge whether it is worth reading.\n"
 			. "Be direct. 1-3 sentences.\n\n"
 			. "Title: {$title}\nSource: {$source}\n\nContent:\n{$content}\n\n"
 			. "Return ONLY the summary, no quotes, no prefix.";
+	}
 
+	private function generateSummary(string $apiKey, string $model, FreshRSS_Entry $entry): ?string {
+		$prompt = $this->buildSummaryPrompt($entry);
 		$summary = $this->callClaude($apiKey, $model, $prompt, 300);
 		return $summary ? trim($summary) : null;
 	}
@@ -509,65 +516,46 @@ class AiAssistantExtension extends Minz_Extension {
 
 	private function ajaxSummarize(): void {
 		$entryId = self::jsonParam('entry_id');
-		if (!$entryId) {
-			echo json_encode(['status' => 'error', 'message' => 'No entry ID']);
-			return;
-		}
+		if (!$entryId) { $this->jsonError('No entry ID'); return; }
 
 		$apiKey = $this->getUserConfigurationValue('api_key');
 		$model = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-6';
-
-		if (!$apiKey) {
-			echo json_encode(['status' => 'error', 'message' => 'No API key configured']);
-			return;
-		}
+		if (!$apiKey) { $this->jsonError('No API key configured'); return; }
 
 		$entryDAO = FreshRSS_Factory::createEntryDao();
 		$entry = $entryDAO->searchById($entryId);
-		if (!$entry) {
-			echo json_encode(['status' => 'error', 'message' => 'Entry not found']);
-			return;
+		if (!$entry) { $this->jsonError('Entry not found'); return; }
+
+		$prompt = $this->buildSummaryPrompt($entry);
+
+		$this->beginSSE();
+		$summary = $this->streamClaudeMessages($apiKey, $model, '', [['role' => 'user', 'content' => $prompt]], 500);
+
+		if ($summary !== null) {
+			$summary = trim($summary);
+			$entry->_attribute('ai_summary', $summary);
+			$entryDAO->updateEntry($entry->toArray());
 		}
-
-		$summary = $this->generateSummary($apiKey, $model, $entry);
-		if ($summary === null) {
-			echo json_encode(['status' => 'error', 'message' => 'Claude API call failed']);
-			return;
-		}
-
-		$entry->_attribute('ai_summary', $summary);
-		$entryDAO->updateEntry($entry->toArray());
-
-		echo json_encode(['status' => 'ok', 'summary' => $summary]);
 	}
 
 	// ── Detail generation ───────────────────────────────────────────────────
 
 	private function ajaxDetail(): void {
 		$entryId = self::jsonParam('entry_id');
-		if (!$entryId) {
-			echo json_encode(['status' => 'error', 'message' => 'No entry ID']);
-			return;
-		}
+		if (!$entryId) { $this->jsonError('No entry ID'); return; }
 
 		$apiKey = $this->getUserConfigurationValue('api_key');
 		$model = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-6';
-
-		if (!$apiKey) {
-			echo json_encode(['status' => 'error', 'message' => 'No API key configured']);
-			return;
-		}
+		if (!$apiKey) { $this->jsonError('No API key configured'); return; }
 
 		$entryDAO = FreshRSS_Factory::createEntryDao();
 		$entry = $entryDAO->searchById($entryId);
-		if (!$entry) {
-			echo json_encode(['status' => 'error', 'message' => 'Entry not found']);
-			return;
-		}
+		if (!$entry) { $this->jsonError('Entry not found'); return; }
 
-		// Return cached detail if available
+		// Return cached detail as JSON (no streaming needed)
 		$cached = $entry->attributes()['ai_detail'] ?? null;
 		if ($cached) {
+			header('Content-Type: application/json');
 			echo json_encode(['status' => 'ok', 'detail' => $cached]);
 			return;
 		}
@@ -589,17 +577,14 @@ class AiAssistantExtension extends Minz_Extension {
 			. "Format: **Section Title** on its own line, then detail paragraph. No\n"
 			. "markdown headers or bullets.";
 
-		$detail = $this->callClaude($apiKey, $model, $prompt, 1500);
-		if ($detail === null) {
-			echo json_encode(['status' => 'error', 'message' => 'Claude API call failed']);
-			return;
+		$this->beginSSE();
+		$detail = $this->streamClaudeMessages($apiKey, $model, '', [['role' => 'user', 'content' => $prompt]], 1500);
+
+		if ($detail !== null) {
+			$detail = trim($detail);
+			$entry->_attribute('ai_detail', $detail);
+			$entryDAO->updateEntry($entry->toArray());
 		}
-
-		$detail = trim($detail);
-		$entry->_attribute('ai_detail', $detail);
-		$entryDAO->updateEntry($entry->toArray());
-
-		echo json_encode(['status' => 'ok', 'detail' => $detail]);
 	}
 
 	private function formatDetail(string $detail): string {
@@ -729,27 +714,17 @@ class AiAssistantExtension extends Minz_Extension {
 		$message = self::jsonParam('message');
 		$model = self::jsonParam('model');
 
-		if (!$entryId || !$message) {
-			echo json_encode(['status' => 'error', 'message' => 'Missing entry_id or message']);
-			return;
-		}
+		if (!$entryId || !$message) { $this->jsonError('Missing entry_id or message'); return; }
 
 		$apiKey = $this->getUserConfigurationValue('api_key');
 		if (!$model) {
 			$model = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-6';
 		}
-
-		if (!$apiKey) {
-			echo json_encode(['status' => 'error', 'message' => 'No API key configured']);
-			return;
-		}
+		if (!$apiKey) { $this->jsonError('No API key configured'); return; }
 
 		$entryDAO = FreshRSS_Factory::createEntryDao();
 		$entry = $entryDAO->searchById($entryId);
-		if (!$entry) {
-			echo json_encode(['status' => 'error', 'message' => 'Entry not found']);
-			return;
-		}
+		if (!$entry) { $this->jsonError('Entry not found'); return; }
 
 		$profile = $this->getUserConfigurationValue('interest_profile');
 		$content = $this->getEntryContent($entry, 6000, $entryDAO);
@@ -761,7 +736,6 @@ class AiAssistantExtension extends Minz_Extension {
 		$contentType = $isVideo ? 'YouTube video' : 'article';
 		$contentTag = $isVideo ? 'video_transcript' : 'article_content';
 
-		// Build system prompt with article/video context
 		$system = "You are a research assistant helping a reader understand a {$contentType}.\n\n"
 			. "{$contentType}: {$title}\nSource: {$source}\n\n"
 			. "<{$contentTag}>\n{$content}\n</{$contentTag}>";
@@ -781,34 +755,27 @@ class AiAssistantExtension extends Minz_Extension {
 			. "or search the web — but clearly note when you're going beyond the source material. "
 			. "Be concise and direct.";
 
-		// Load existing chat history
 		$chatHistory = $entry->attributes()['ai_chat'] ?? [];
 		if (!is_array($chatHistory)) {
 			$chatHistory = [];
 		}
 
-		// Build messages array: prior turns + new message
 		$messages = [];
 		foreach ($chatHistory as $turn) {
 			$messages[] = ['role' => $turn['role'], 'content' => $turn['content']];
 		}
 		$messages[] = ['role' => 'user', 'content' => $message];
 
-		$response = $this->callClaudeMessages($apiKey, $model, $system, $messages, 1500, true);
-		if ($response === null) {
-			echo json_encode(['status' => 'error', 'message' => 'Claude API call failed']);
-			return;
+		$this->beginSSE();
+		$response = $this->streamClaudeMessages($apiKey, $model, $system, $messages, 1500, true);
+
+		if ($response !== null) {
+			$response = trim($response);
+			$chatHistory[] = ['role' => 'user', 'content' => $message];
+			$chatHistory[] = ['role' => 'assistant', 'content' => $response];
+			$entry->_attribute('ai_chat', $chatHistory);
+			$entryDAO->updateEntry($entry->toArray());
 		}
-
-		$response = trim($response);
-
-		// Append to chat history and save
-		$chatHistory[] = ['role' => 'user', 'content' => $message];
-		$chatHistory[] = ['role' => 'assistant', 'content' => $response];
-		$entry->_attribute('ai_chat', $chatHistory);
-		$entryDAO->updateEntry($entry->toArray());
-
-		echo json_encode(['status' => 'ok', 'response' => $response, 'history' => $chatHistory]);
 	}
 
 	// ── Claude API ───────────────────────────────────────────────────────────
@@ -864,6 +831,107 @@ class AiAssistantExtension extends Minz_Extension {
 
 	private function callClaude(string $apiKey, string $model, string $prompt, int $maxTokens): ?string {
 		return $this->callClaudeMessages($apiKey, $model, '', [['role' => 'user', 'content' => $prompt]], $maxTokens);
+	}
+
+	// ── Streaming Claude API ────────────────────────────────────────────────
+
+	private function beginSSE(): void {
+		header('Content-Type: text/event-stream');
+		header('Cache-Control: no-cache');
+		header('Connection: keep-alive');
+		header('X-Accel-Buffering: no');
+		while (ob_get_level()) ob_end_flush();
+		flush();
+	}
+
+	private function sendSSE(string $type, string $data = ''): void {
+		echo "data: " . json_encode([$type => $data ?: true]) . "\n\n";
+		flush();
+	}
+
+	private function streamClaudeMessages(
+		string $apiKey, string $model, string $system,
+		array $messages, int $maxTokens, bool $webSearch = false
+	): ?string {
+		$body = [
+			'model' => $model,
+			'max_tokens' => $maxTokens,
+			'stream' => true,
+			'messages' => $messages,
+		];
+		if ($system !== '') {
+			$body['system'] = $system;
+		}
+		if ($webSearch) {
+			$body['tools'] = [
+				['type' => 'web_search_20250305', 'name' => 'web_search', 'max_uses' => 3],
+			];
+		}
+
+		$fullText = '';
+		$buffer = '';
+
+		$ch = curl_init('https://api.anthropic.com/v1/messages');
+		curl_setopt_array($ch, [
+			CURLOPT_POST => true,
+			CURLOPT_HTTPHEADER => [
+				'Content-Type: application/json',
+				'x-api-key: ' . $apiKey,
+				'anthropic-version: 2023-06-01',
+			],
+			CURLOPT_POSTFIELDS => json_encode($body),
+			CURLOPT_RETURNTRANSFER => false,
+			CURLOPT_TIMEOUT => 120,
+			CURLOPT_WRITEFUNCTION => function ($ch, $data) use (&$fullText, &$buffer) {
+				$buffer .= $data;
+				while (($pos = strpos($buffer, "\n\n")) !== false) {
+					$frame = substr($buffer, 0, $pos);
+					$buffer = substr($buffer, $pos + 2);
+
+					foreach (explode("\n", $frame) as $line) {
+						if (!str_starts_with($line, 'data: ')) continue;
+						$json = json_decode(substr($line, 6), true);
+						if (!$json) continue;
+
+						$type = $json['type'] ?? '';
+						if ($type === 'content_block_delta') {
+							$delta = $json['delta'] ?? [];
+							if (($delta['type'] ?? '') === 'text_delta') {
+								$text = $delta['text'];
+								$fullText .= $text;
+								echo "data: " . json_encode(['text' => $text]) . "\n\n";
+								flush();
+							}
+						} elseif ($type === 'error') {
+							$msg = $json['error']['message'] ?? 'API error';
+							echo "data: " . json_encode(['error' => $msg]) . "\n\n";
+							flush();
+						}
+					}
+				}
+				return strlen($data);
+			},
+		]);
+
+		$success = curl_exec($ch);
+		$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		curl_close($ch);
+
+		if (!$success || $httpCode !== 200) {
+			echo "data: " . json_encode(['error' => "API error (HTTP {$httpCode})"]) . "\n\n";
+			flush();
+			return null;
+		}
+
+		echo "data: " . json_encode(['done' => true]) . "\n\n";
+		flush();
+
+		return $fullText ?: null;
+	}
+
+	private function jsonError(string $message): void {
+		header('Content-Type: application/json');
+		echo json_encode(['status' => 'error', 'message' => $message]);
 	}
 
 	private function parseJsonResponse(string $text): ?array {

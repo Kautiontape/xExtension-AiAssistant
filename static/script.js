@@ -25,6 +25,62 @@
 		});
 	}
 
+	// ── Streaming fetch helper ──────────────────────────────────────────────
+
+	function streamPost(action, params, onText, onDone, onError) {
+		params._csrf = context.csrf;
+		params.ajax = true;
+		fetch(getAjaxUrl(action), {
+			method: "POST",
+			headers: { "Content-Type": "application/json; charset=UTF-8" },
+			body: JSON.stringify(params),
+		})
+			.then(function (r) {
+				var ct = r.headers.get("content-type") || "";
+				if (ct.indexOf("text/event-stream") === -1) {
+					// JSON response (error or cached result)
+					return r.json().then(function (data) {
+						if (data.status === "ok") {
+							onDone(data);
+						} else {
+							onError(data.message || "Request failed");
+						}
+					});
+				}
+				var reader = r.body.getReader();
+				var decoder = new TextDecoder();
+				var buffer = "";
+				function pump() {
+					reader.read().then(function (result) {
+						if (result.done) {
+							onDone(null);
+							return;
+						}
+						buffer += decoder.decode(result.value, { stream: true });
+						var parts = buffer.split("\n\n");
+						buffer = parts.pop();
+						parts.forEach(function (frame) {
+							var match = frame.match(/^data:\s*(.+)$/m);
+							if (!match) return;
+							try {
+								var evt = JSON.parse(match[1]);
+								if (evt.error) onError(evt.error);
+								else if (evt.text) onText(evt.text);
+								else if (evt.done) onDone(null);
+							} catch (e) {
+								/* ignore parse errors */
+							}
+						});
+						pump();
+					});
+				}
+				pump();
+			})
+			.catch(function () {
+				onError("Request failed");
+			});
+	}
+
 	// ── Chunked batch scoring ───────────────────────────────────────────────
 
 	function scorePendingEntries() {
@@ -154,27 +210,43 @@
 		btn.disabled = true;
 		btn.textContent = "Summarizing\u2026";
 
-		ajaxPost("summarize", { entry_id: entryId })
-			.then(function (data) {
-				if (data.status === "ok" && data.summary) {
-					var span = document.createElement("span");
+		var span = null;
+
+		streamPost(
+			"summarize",
+			{ entry_id: entryId },
+			function onText(text) {
+				if (!span) {
+					span = document.createElement("span");
 					span.className = "ai-summary";
+					btn.replaceWith(span);
+				}
+				span.textContent += text;
+			},
+			function onDone(data) {
+				// Handle cached JSON response (non-streaming)
+				if (data && data.summary) {
+					if (!span) {
+						span = document.createElement("span");
+						span.className = "ai-summary";
+						btn.replaceWith(span);
+					}
 					span.textContent = data.summary;
+				}
+				if (span) {
 					var detailBtn = document.createElement("button");
 					detailBtn.className = "ai-detail-btn";
 					detailBtn.textContent = "More detail";
-					btn.replaceWith(span);
-					// Insert detail button after the summary span
 					span.after(detailBtn);
-				} else {
+				}
+			},
+			function onError() {
+				if (!span) {
 					btn.textContent = "Failed";
 					btn.disabled = false;
 				}
-			})
-			.catch(function () {
-				btn.textContent = "Failed";
-				btn.disabled = false;
-			});
+			},
+		);
 	}
 
 	// ── Detail ──────────────────────────────────────────────────────────────
@@ -186,28 +258,48 @@
 		btn.disabled = true;
 		btn.textContent = "Loading\u2026";
 
-		ajaxPost("detail", { entry_id: entryId })
-			.then(function (data) {
-				if (data.status === "ok" && data.detail) {
-					var detailDiv = document.createElement("div");
-					detailDiv.className = "ai-detail";
-					detailDiv.innerHTML = formatDetail(data.detail);
-					// Insert after the container's inline content (as last child, before closing)
-					container.appendChild(detailDiv);
+		var detailDiv = null;
+		var fullText = "";
 
-					// Replace button with toggle
+		streamPost(
+			"detail",
+			{ entry_id: entryId },
+			function onText(text) {
+				fullText += text;
+				if (!detailDiv) {
+					detailDiv = document.createElement("div");
+					detailDiv.className = "ai-detail";
+					container.appendChild(detailDiv);
 					btn.textContent = "Hide detail";
-					btn.disabled = false;
 					btn.className = "ai-detail-toggle";
-				} else {
-					btn.textContent = "Failed";
 					btn.disabled = false;
 				}
-			})
-			.catch(function () {
+				// Show raw text while streaming, format on done
+				detailDiv.textContent = fullText;
+				detailDiv.scrollIntoView({ block: "nearest" });
+			},
+			function onDone(data) {
+				// Handle cached JSON response
+				if (data && data.detail) {
+					fullText = data.detail;
+					if (!detailDiv) {
+						detailDiv = document.createElement("div");
+						detailDiv.className = "ai-detail";
+						container.appendChild(detailDiv);
+					}
+					btn.textContent = "Hide detail";
+					btn.className = "ai-detail-toggle";
+					btn.disabled = false;
+				}
+				if (detailDiv) {
+					detailDiv.innerHTML = formatDetail(fullText);
+				}
+			},
+			function onError() {
 				btn.textContent = "Failed";
 				btn.disabled = false;
-			});
+			},
+		);
 	}
 
 	function handleDetailToggle(btn) {
@@ -352,34 +444,38 @@
 			input.value = "";
 			sendBtn.disabled = true;
 
-			var thinking = appendMessage(messagesDiv, "assistant", "Thinking\u2026");
-			thinking.classList.add("ai-chat-thinking");
+			var msgDiv = appendMessage(messagesDiv, "assistant", "");
+			msgDiv.classList.add("ai-chat-thinking");
+			var fullText = "";
 
-			ajaxPost("chat", {
-				entry_id: entryId,
-				message: text,
-				model: modelSelect.value,
-			})
-				.then(function (data) {
-					thinking.remove();
-					if (data.status === "ok" && data.response) {
-						appendMessage(messagesDiv, "assistant", data.response);
-					} else {
-						appendMessage(
-							messagesDiv,
-							"assistant",
-							"Error: " + (data.message || "Request failed"),
-						);
+			streamPost(
+				"chat",
+				{
+					entry_id: entryId,
+					message: text,
+					model: modelSelect.value,
+				},
+				function onText(chunk) {
+					msgDiv.classList.remove("ai-chat-thinking");
+					fullText += chunk;
+					msgDiv.textContent = fullText;
+					messagesDiv.scrollTop = messagesDiv.scrollHeight;
+				},
+				function onDone() {
+					msgDiv.classList.remove("ai-chat-thinking");
+					if (fullText) {
+						msgDiv.innerHTML = formatChatMessage(fullText);
 					}
 					sendBtn.disabled = false;
 					input.focus();
-				})
-				.catch(function () {
-					thinking.remove();
-					appendMessage(messagesDiv, "assistant", "Error: Request failed");
+				},
+				function onError(msg) {
+					msgDiv.classList.remove("ai-chat-thinking");
+					msgDiv.textContent = "Error: " + (msg || "Request failed");
 					sendBtn.disabled = false;
 					input.focus();
-				});
+				},
+			);
 		}
 
 		sendBtn.addEventListener("click", send);
