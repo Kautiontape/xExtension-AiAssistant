@@ -362,6 +362,34 @@
 			});
 	}
 
+	// ── Load transcript ─────────────────────────────────────────────────────
+
+	function handleLoadTranscript(btn) {
+		var entryId = btn.dataset.entryId;
+		btn.disabled = true;
+		btn.textContent = "Loading\u2026";
+
+		ajaxPost("fetch_transcript", { entry_id: entryId })
+			.then(function (data) {
+				if (data.status === "ok" && data.transcript) {
+					var details = document.createElement("details");
+					details.className = "ai-transcript-section";
+					details.innerHTML =
+						"<summary>Video Transcript</summary>" +
+						'<div class="ai-transcript-content">' +
+						escapeHtml(data.transcript).replace(/\n/g, "<br>") +
+						"</div>";
+					btn.replaceWith(details);
+				} else {
+					btn.textContent = "Transcript unavailable";
+				}
+			})
+			.catch(function () {
+				btn.textContent = "Failed to load";
+				btn.disabled = false;
+			});
+	}
+
 	// ── Chat modal ──────────────────────────────────────────────────────────
 
 	var chatOverlay = null;
@@ -558,6 +586,12 @@
 			var feedbackBtn = e.target.closest(".ai-feedback-btn");
 			if (feedbackBtn) {
 				handleFeedback(feedbackBtn);
+				return;
+			}
+
+			var transcriptBtn = e.target.closest(".ai-load-transcript-btn");
+			if (transcriptBtn) {
+				handleLoadTranscript(transcriptBtn);
 				return;
 			}
 		});

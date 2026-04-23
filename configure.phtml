@@ -59,7 +59,8 @@ $csrfToken = FreshRSS_Auth::csrfToken();
 				<label>Per-Feed Settings</label>
 				<p class="help-block">
 					<strong>Score</strong> — checked feeds get AI-scored. Unchecked feeds skip all scoring logic.<br>
-					<strong>Summarize</strong> — checked feeds always get summarized, regardless of score.
+					<strong>Summarize</strong> — checked feeds always get summarized, regardless of score.<br>
+					<strong>Fetch</strong> — fetch full article content from source URL when RSS content is sparse.
 				</p>
 				<?php foreach ($this->categories as $c) { ?>
 				<table class="table table-condensed" style="margin-bottom: 4px;">
@@ -70,6 +71,9 @@ $csrfToken = FreshRSS_Auth::csrfToken();
 							</th>
 							<th style="width: 40px; height: 60px; vertical-align: bottom; position: relative;">
 								<span style="display: inline-block; transform: rotate(-45deg); transform-origin: bottom left; white-space: nowrap; position: absolute; bottom: 6px; left: 20px; font-size: 12px;">Summarize</span>
+							</th>
+							<th style="width: 40px; height: 60px; vertical-align: bottom; position: relative;">
+								<span style="display: inline-block; transform: rotate(-45deg); transform-origin: bottom left; white-space: nowrap; position: absolute; bottom: 6px; left: 20px; font-size: 12px;">Fetch</span>
 							</th>
 							<th></th>
 						</tr>
@@ -90,6 +94,13 @@ $csrfToken = FreshRSS_Auth::csrfToken();
 									value="1"
 									<?= $this->getSummarizeCategory($c->id()) ? 'checked' : '' ?>>
 							</td>
+							<td style="text-align: center;">
+								<input type="checkbox"
+									id="fetch_cat_<?= $c->id() ?>"
+									name="fetch_cat_<?= $c->id() ?>"
+									value="1"
+									<?= $this->getFetchCategory($c->id()) ? 'checked' : '' ?>>
+							</td>
 							<td><strong><label for="score_cat_<?= $c->id() ?>"><?= htmlspecialchars($c->name()) ?></label></strong></td>
 						</tr>
 						<?php foreach ($c->feeds() as $f) { ?>
@@ -107,6 +118,13 @@ $csrfToken = FreshRSS_Auth::csrfToken();
 										name="sum_feed_<?= $f->id() ?>"
 										value="1"
 										<?= $this->getSummarizeFeed($f->id()) ? 'checked' : '' ?>>
+								</td>
+								<td style="text-align: center; padding-left: 10px;">
+									<input type="checkbox"
+										id="fetch_feed_<?= $f->id() ?>"
+										name="fetch_feed_<?= $f->id() ?>"
+										value="1"
+										<?= $this->getFetchFeed($f->id()) ? 'checked' : '' ?>>
 								</td>
 								<td style="padding-left: 20px;"><label for="score_feed_<?= $f->id() ?>"><?= htmlspecialchars($f->name()) ?></label></td>
 							</tr>

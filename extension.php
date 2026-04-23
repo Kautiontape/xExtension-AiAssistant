@@ -42,6 +42,7 @@ class AiAssistantExtension extends Minz_Extension {
 				. '<button class="ai-chat-btn">Chat</button>'
 				. '</div>';
 			$entry->_content($placeholder . $entry->content());
+			$this->injectTranscriptSection($entry);
 			return $entry;
 		}
 
@@ -85,7 +86,34 @@ class AiAssistantExtension extends Minz_Extension {
 			. '</div>';
 
 		$entry->_content($html . $entry->content());
+
+		// Inject transcript section for YouTube videos
+		$this->injectTranscriptSection($entry);
 		return $entry;
+	}
+
+	/**
+	 * Append a collapsible transcript section to YouTube entries.
+	 */
+	private function injectTranscriptSection(FreshRSS_Entry $entry): void {
+		if (!$this->isYoutube($entry) || $this->isYoutubeShort($entry)) {
+			return;
+		}
+
+		$transcript = $entry->attributes()['yt_transcript'] ?? null;
+		$entryId = htmlspecialchars($entry->id());
+
+		if ($transcript) {
+			$escaped = htmlspecialchars($transcript);
+			$section = '<details class="ai-transcript-section">'
+				. '<summary>Video Transcript</summary>'
+				. '<div class="ai-transcript-content">' . nl2br($escaped) . '</div>'
+				. '</details>';
+			$entry->_content($entry->content() . $section);
+		} else {
+			$btn = '<button class="ai-load-transcript-btn" data-entry-id="' . $entryId . '">Load Transcript</button>';
+			$entry->_content($entry->content() . $btn);
+		}
 	}
 
 	// ── Config page + AJAX router ────────────────────────────────────────────
@@ -106,6 +134,8 @@ class AiAssistantExtension extends Minz_Extension {
 		$this->summarizeCategories = $this->loadAttribute('ext_ai_assistant_summarize_categories');
 		$this->scoreFeeds = $this->loadAttribute('ext_ai_assistant_score_feeds');
 		$this->scoreCategories = $this->loadAttribute('ext_ai_assistant_score_categories');
+		$this->fetchFeeds = $this->loadAttribute('ext_ai_assistant_fetch_feeds');
+		$this->fetchCategories = $this->loadAttribute('ext_ai_assistant_fetch_categories');
 
 		// Normal POST: save settings
 		if (Minz_Request::isPost()) {
@@ -122,12 +152,17 @@ class AiAssistantExtension extends Minz_Extension {
 			$sumCatConfig = [];
 			$scoreFeedConfig = [];
 			$scoreCatConfig = [];
+			$fetchFeedConfig = [];
+			$fetchCatConfig = [];
 			foreach ($this->categories as $c) {
 				if (Minz_Request::paramBoolean('sum_cat_' . $c->id())) {
 					$sumCatConfig[$c->id()] = true;
 				}
 				if (Minz_Request::paramBoolean('score_cat_' . $c->id())) {
 					$scoreCatConfig[$c->id()] = true;
+				}
+				if (Minz_Request::paramBoolean('fetch_cat_' . $c->id())) {
+					$fetchCatConfig[$c->id()] = true;
 				}
 				foreach ($c->feeds() as $f) {
 					if (Minz_Request::paramBoolean('sum_feed_' . $f->id())) {
@@ -136,12 +171,17 @@ class AiAssistantExtension extends Minz_Extension {
 					if (Minz_Request::paramBoolean('score_feed_' . $f->id())) {
 						$scoreFeedConfig[$f->id()] = true;
 					}
+					if (Minz_Request::paramBoolean('fetch_feed_' . $f->id())) {
+						$fetchFeedConfig[$f->id()] = true;
+					}
 				}
 			}
 			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_summarize_feeds', json_encode($sumFeedConfig));
 			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_summarize_categories', json_encode($sumCatConfig));
 			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_score_feeds', json_encode($scoreFeedConfig));
 			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_score_categories', json_encode($scoreCatConfig));
+			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_fetch_feeds', json_encode($fetchFeedConfig));
+			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_fetch_categories', json_encode($fetchCatConfig));
 			FreshRSS_Context::userConf()->save();
 
 			// Reload for display
@@ -149,6 +189,8 @@ class AiAssistantExtension extends Minz_Extension {
 			$this->summarizeCategories = $sumCatConfig;
 			$this->scoreFeeds = $scoreFeedConfig;
 			$this->scoreCategories = $scoreCatConfig;
+			$this->fetchFeeds = $fetchFeedConfig;
+			$this->fetchCategories = $fetchCatConfig;
 		}
 	}
 
@@ -158,6 +200,8 @@ class AiAssistantExtension extends Minz_Extension {
 	public array $summarizeCategories = [];
 	public array $scoreFeeds = [];
 	public array $scoreCategories = [];
+	public array $fetchFeeds = [];
+	public array $fetchCategories = [];
 
 	public function getSummarizeFeed(int $id): bool {
 		return isset($this->summarizeFeeds[$id]);
@@ -173,6 +217,14 @@ class AiAssistantExtension extends Minz_Extension {
 
 	public function getScoreCategory(int $id): bool {
 		return isset($this->scoreCategories[$id]);
+	}
+
+	public function getFetchFeed(int $id): bool {
+		return isset($this->fetchFeeds[$id]);
+	}
+
+	public function getFetchCategory(int $id): bool {
+		return isset($this->fetchCategories[$id]);
 	}
 
 	private function loadAttribute(string $key): array {
@@ -244,6 +296,117 @@ class AiAssistantExtension extends Minz_Extension {
 		return $transcript;
 	}
 
+	private function shouldFetchFullContent(FreshRSS_Entry $entry): bool {
+		$feedId = $entry->feedId();
+		$feed = $entry->feed(false);
+		$catId = $feed ? ($feed->category() ? $feed->category()->id() : null) : null;
+
+		$feedConfig = $this->loadAttribute('ext_ai_assistant_fetch_feeds');
+		$catConfig = $this->loadAttribute('ext_ai_assistant_fetch_categories');
+
+		return isset($feedConfig[$feedId]) || ($catId !== null && isset($catConfig[$catId]));
+	}
+
+	/**
+	 * Fetch full article content from source URL using common selectors.
+	 */
+	private function fetchFullContent(FreshRSS_Entry $entry, $entryDAO = null): ?string {
+		// Check cache first (empty string = previous failure)
+		$cached = $entry->attributes()['full_content'] ?? null;
+		if ($cached !== null) {
+			return $cached ?: null;
+		}
+
+		$url = $entry->link();
+		if (!$url) {
+			$this->cacheFullContent($entry, '', $entryDAO);
+			return null;
+		}
+
+		$ch = curl_init($url);
+		curl_setopt_array($ch, [
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_FOLLOWLOCATION => true,
+			CURLOPT_TIMEOUT => 10,
+			CURLOPT_CONNECTTIMEOUT => 5,
+			CURLOPT_USERAGENT => 'FreshRSS/AiAssistant',
+		]);
+		$html = curl_exec($ch);
+		$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		curl_close($ch);
+
+		if ($httpCode !== 200 || !$html) {
+			$this->cacheFullContent($entry, '', $entryDAO);
+			return null;
+		}
+
+		libxml_use_internal_errors(true);
+		$dom = new DOMDocument();
+		$dom->loadHTML('<?xml encoding="UTF-8">' . $html, LIBXML_NOERROR);
+		libxml_clear_errors();
+
+		$xpath = new DOMXPath($dom);
+		$selectors = [
+			'//article',
+			'//*[@role="main"]',
+			'//*[contains(@class,"post-content")]',
+			'//*[contains(@class,"article-body")]',
+			'//*[contains(@class,"entry-content")]',
+			'//*[contains(@class,"story-body")]',
+			'//main',
+		];
+
+		$content = null;
+		foreach ($selectors as $selector) {
+			$nodes = $xpath->query($selector);
+			if ($nodes && $nodes->length > 0) {
+				$content = $dom->saveHTML($nodes->item(0));
+				break;
+			}
+		}
+
+		if (!$content) {
+			$this->cacheFullContent($entry, '', $entryDAO);
+			return null;
+		}
+
+		$text = $this->htmlToText($content);
+		$this->cacheFullContent($entry, $text, $entryDAO);
+		return $text;
+	}
+
+	private function cacheFullContent(FreshRSS_Entry $entry, string $content, $entryDAO = null): void {
+		$entry->_attribute('full_content', $content);
+		if ($entryDAO) {
+			$entryDAO->updateEntry($entry->toArray());
+		}
+	}
+
+	/**
+	 * Convert HTML to clean plain text, handling table layouts, entities, etc.
+	 */
+	private function htmlToText(string $html): string {
+		// Remove AI assistant container injected by this extension
+		$html = preg_replace('/<div class="ai-assistant-container".*?<\/div>/s', '', $html);
+		// Remove script and style blocks
+		$html = preg_replace('/<script\b[^>]*>.*?<\/script>/si', '', $html);
+		$html = preg_replace('/<style\b[^>]*>.*?<\/style>/si', '', $html);
+		// Block elements → newlines
+		$html = preg_replace('/<\/(?:p|div|tr|h[1-6]|li|blockquote|figcaption)>/i', "\n", $html);
+		$html = preg_replace('/<br\s*\/?>/i', "\n", $html);
+		// Table cells → spaces
+		$html = preg_replace('/<\/(?:td|th)>/i', '  ', $html);
+		// Strip remaining tags
+		$html = strip_tags($html);
+		// Decode HTML entities
+		$html = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+		// Collapse multiple blank lines
+		$html = preg_replace('/\n{3,}/', "\n\n", $html);
+		// Collapse runs of spaces/tabs on a single line
+		$html = preg_replace('/[^\S\n]+/', ' ', $html);
+		return trim($html);
+	}
+
 	/**
 	 * Get the best available content for an entry (transcript for YouTube, stripped HTML otherwise).
 	 */
@@ -255,7 +418,18 @@ class AiAssistantExtension extends Minz_Extension {
 				return mb_substr($transcript, 0, $maxChars);
 			}
 		}
-		return mb_substr(strip_tags($entry->content()), 0, $maxChars);
+
+		$text = $this->htmlToText($entry->content());
+
+		// If content is sparse and full-content fetching is enabled, try fetching from source
+		if (mb_strlen($text) < 200 && $this->shouldFetchFullContent($entry)) {
+			$fullContent = $this->fetchFullContent($entry, $entryDAO);
+			if ($fullContent && mb_strlen($fullContent) > mb_strlen($text)) {
+				$text = $fullContent;
+			}
+		}
+
+		return mb_substr($text, 0, $maxChars);
 	}
 
 	/**
@@ -266,9 +440,13 @@ class AiAssistantExtension extends Minz_Extension {
 	}
 
 	/**
-	 * Check if an entry is a YouTube Short (by URL pattern).
+	 * Check if an entry is a YouTube Short (cached attribute, then URL fallback).
 	 */
 	private function isYoutubeShort(FreshRSS_Entry $entry): bool {
+		$cached = $entry->attributes()['yt_is_short'] ?? null;
+		if ($cached !== null) {
+			return (bool) $cached;
+		}
 		return str_contains($entry->link(), 'youtube.com/shorts/');
 	}
 
@@ -328,6 +506,12 @@ class AiAssistantExtension extends Minz_Extension {
 			case 'get_profile':
 				$this->ajaxGetProfile();
 				break;
+			case 'fetch_transcript':
+				$this->ajaxFetchTranscript();
+				break;
+			case 'score_pending':
+				$this->ajaxScorePending();
+				break;
 			default:
 				echo json_encode(['status' => 'error', 'message' => 'Unknown action']);
 		}
@@ -342,66 +526,88 @@ class AiAssistantExtension extends Minz_Extension {
 		}
 
 		$apiKey = $this->getUserConfigurationValue('api_key');
-		$profile = $this->getUserConfigurationValue('interest_profile');
-		$model = $this->getUserConfigurationValue('scoring_model') ?: 'claude-haiku-4-5-20251001';
-
 		if (!$apiKey) {
 			echo json_encode(['status' => 'error', 'message' => 'No API key configured']);
 			return;
 		}
 
-		// Load entries
 		$entryDAO = FreshRSS_Factory::createEntryDao();
 		$entries = [];
-		$articlesForPrompt = [];
-
-		$shortResults = [];
 		foreach ($entryIds as $id) {
 			$entry = $entryDAO->searchById($id);
-			if (!$entry) continue;
-
-			// Filter YouTube Shorts by URL (no need to call youtube-helper)
-			if ($this->isYoutubeShort($entry)) {
-				$entry->_attribute('yt_is_short', true);
-				$entry->_attribute('ai_score', 0);
-				$entry->_attribute('ai_score_reason', 'YouTube Short (filtered)');
-				$entry->_attribute('ai_needs_scoring', null);
-				$entry->_isRead(true);
-				$entryDAO->updateEntry($entry->toArray());
-				$shortResults[] = [
-					'id' => $id,
-					'score' => 0,
-					'reason' => 'YouTube Short (filtered)',
-				];
-				continue;
+			if ($entry) {
+				$entries[] = $entry;
 			}
+		}
 
-			// For non-Short YouTube entries, fetch transcript
+		$result = $this->scoreEntryBatch($entries, $entryDAO);
+		if ($result === null) {
+			echo json_encode(['status' => 'error', 'message' => 'Scoring failed']);
+			return;
+		}
+		echo json_encode(['status' => 'ok', 'scores' => $result]);
+	}
+
+	/**
+	 * Score a batch of entries. Returns array of score results, or null on failure.
+	 * Usable from both AJAX and CLI contexts.
+	 */
+	public function scoreEntryBatch(array $entries, $entryDAO): ?array {
+		$apiKey = $this->getUserConfigurationValue('api_key');
+		$profile = $this->getUserConfigurationValue('interest_profile');
+		$model = $this->getUserConfigurationValue('scoring_model') ?: 'claude-haiku-4-5-20251001';
+
+		if (!$apiKey) return null;
+
+		$entryMap = [];
+		$articlesForPrompt = [];
+		$shortResults = [];
+
+		foreach ($entries as $entry) {
+			$id = $entry->id();
+
 			if ($this->isYoutube($entry)) {
+				$videoId = $this->extractYoutubeVideoId($entry->link());
+				$info = $videoId ? $this->fetchYoutubeInfo($videoId) : null;
+
+				if ($info) {
+					$entry->_attribute('yt_is_short', !empty($info['is_short']));
+					$entry->_attribute('yt_duration', $info['duration']);
+				}
+
+				if ($this->isYoutubeShort($entry)) {
+					$entry->_attribute('ai_score', 0);
+					$entry->_attribute('ai_score_reason', 'YouTube Short (filtered)');
+					$entry->_attribute('ai_needs_scoring', null);
+					$entry->_isRead(true);
+					$entryDAO->updateEntry($entry->toArray());
+					$shortResults[] = ['id' => $id, 'score' => 0, 'reason' => 'YouTube Short (filtered)'];
+					continue;
+				}
+
 				$transcript = $this->getYoutubeTranscript($entry, $entryDAO);
-				$entries[$id] = $entry;
+				$entryMap[$id] = $entry;
 				$articlesForPrompt[] = [
 					'id' => $id,
 					'title' => $entry->title(),
 					'source' => $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown',
 					'summary' => $transcript
 						? mb_substr($transcript, 0, 500)
-						: mb_substr(strip_tags($entry->content()), 0, 300),
+						: mb_substr($this->htmlToText($entry->content()), 0, 300),
 				];
 			} else {
-				$entries[$id] = $entry;
+				$entryMap[$id] = $entry;
 				$articlesForPrompt[] = [
 					'id' => $id,
 					'title' => $entry->title(),
 					'source' => $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown',
-					'summary' => mb_substr(strip_tags($entry->content()), 0, 300),
+					'summary' => mb_substr($this->htmlToText($entry->content()), 0, 300),
 				];
 			}
 		}
 
 		if (empty($articlesForPrompt)) {
-			echo json_encode(['status' => 'ok', 'scores' => $shortResults]);
-			return;
+			return $shortResults;
 		}
 
 		$prompt = "Score these articles/videos for relevance based on the interest profile below.\n\n"
@@ -416,18 +622,11 @@ class AiAssistantExtension extends Minz_Extension {
 			. "Return ONLY the JSON array, no markdown fences, no other text.";
 
 		$response = $this->callClaude($apiKey, $model, $prompt, 2000);
-		if ($response === null) {
-			echo json_encode(['status' => 'error', 'message' => 'Claude API call failed']);
-			return;
-		}
+		if ($response === null) return null;
 
 		$scores = $this->parseJsonResponse($response);
-		if (!is_array($scores)) {
-			echo json_encode(['status' => 'error', 'message' => 'Failed to parse scores']);
-			return;
-		}
+		if (!is_array($scores)) return null;
 
-		// Write scores to entry attributes
 		$results = [];
 		$threshold = intval($this->getUserConfigurationValue('summary_threshold') ?: 5);
 		$summaryModel = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-6';
@@ -435,9 +634,9 @@ class AiAssistantExtension extends Minz_Extension {
 
 		foreach ($scores as $s) {
 			$id = $s['id'] ?? null;
-			if ($id === null || !isset($entries[$id])) continue;
+			if ($id === null || !isset($entryMap[$id])) continue;
 
-			$entry = $entries[$id];
+			$entry = $entryMap[$id];
 			$score = intval($s['score'] ?? 5);
 			$reason = $s['reason'] ?? '';
 
@@ -453,18 +652,16 @@ class AiAssistantExtension extends Minz_Extension {
 				'reason' => $reason,
 			];
 
-			// Auto-summarize if score >= threshold OR always-summarize feed/category
 			if ($score >= $threshold || $this->isAlwaysSummarize($entry)) {
 				$summaryEntries[] = ['id' => $id, 'entry' => $entry, 'score' => $score];
 			}
 		}
 
-		// Auto-summarize qualifying articles
 		if (!empty($summaryEntries)) {
 			$this->autoSummarize($apiKey, $summaryModel, $summaryEntries, $entryDAO, $results);
 		}
 
-		echo json_encode(['status' => 'ok', 'scores' => array_merge($shortResults, $results)]);
+		return array_merge($shortResults, $results);
 	}
 
 	// ── Summary generation (shared) ─────────────────────────────────────────
@@ -705,6 +902,77 @@ class AiAssistantExtension extends Minz_Extension {
 	private function ajaxGetProfile(): void {
 		$profile = $this->getUserConfigurationValue('interest_profile') ?: '';
 		echo json_encode(['status' => 'ok', 'profile' => $profile]);
+	}
+
+	private function ajaxFetchTranscript(): void {
+		$entryId = self::jsonParam('entry_id');
+		if (!$entryId) {
+			echo json_encode(['status' => 'error', 'message' => 'No entry ID']);
+			return;
+		}
+
+		$entryDAO = FreshRSS_Factory::createEntryDao();
+		$entry = $entryDAO->searchById($entryId);
+		if (!$entry) {
+			echo json_encode(['status' => 'error', 'message' => 'Entry not found']);
+			return;
+		}
+
+		$transcript = $this->getYoutubeTranscript($entry, $entryDAO);
+		if ($transcript) {
+			echo json_encode(['status' => 'ok', 'transcript' => $transcript]);
+		} else {
+			echo json_encode(['status' => 'error', 'message' => 'Transcript unavailable']);
+		}
+	}
+
+	/**
+	 * Find and score all entries with ai_needs_scoring=true.
+	 * Called via AJAX (score_pending action) or from CLI.
+	 */
+	private function ajaxScorePending(): void {
+		$result = $this->scorePendingEntries();
+		echo json_encode($result);
+	}
+
+	/**
+	 * Score all pending entries. Returns status array.
+	 */
+	public function scorePendingEntries(): array {
+		$apiKey = $this->getUserConfigurationValue('api_key');
+		if (!$apiKey) {
+			return ['status' => 'error', 'message' => 'No API key configured'];
+		}
+
+		$entryDAO = FreshRSS_Factory::createEntryDao();
+		$search = new FreshRSS_BooleanSearch('');
+		$allEntries = $entryDAO->listWhere('A', $search, FreshRSS_Entry::STATE_ALL, 'DESC', 200);
+
+		$pending = [];
+		foreach ($allEntries as $entry) {
+			$attrs = $entry->attributes();
+			if (!empty($attrs['ai_needs_scoring']) && !isset($attrs['ai_score'])) {
+				$pending[] = $entry;
+			}
+		}
+
+		if (empty($pending)) {
+			return ['status' => 'ok', 'scored' => 0, 'message' => 'No pending entries'];
+		}
+
+		$totalScored = 0;
+		$allResults = [];
+		$chunks = array_chunk($pending, 10);
+
+		foreach ($chunks as $chunk) {
+			$result = $this->scoreEntryBatch($chunk, $entryDAO);
+			if ($result !== null) {
+				$totalScored += count($result);
+				$allResults = array_merge($allResults, $result);
+			}
+		}
+
+		return ['status' => 'ok', 'scored' => $totalScored, 'results' => $allResults];
 	}
 
 	// ── Chat ────────────────────────────────────────────────────────────────
