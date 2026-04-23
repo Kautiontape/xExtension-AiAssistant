@@ -43,6 +43,7 @@ class AiAssistantExtension extends Minz_Extension {
 				. '</div>';
 			$entry->_content($placeholder . $entry->content());
 			$this->injectTranscriptSection($entry);
+			$this->injectFullContentSection($entry);
 			return $entry;
 		}
 
@@ -89,6 +90,7 @@ class AiAssistantExtension extends Minz_Extension {
 
 		// Inject transcript section for YouTube videos
 		$this->injectTranscriptSection($entry);
+		$this->injectFullContentSection($entry);
 		return $entry;
 	}
 
@@ -112,6 +114,30 @@ class AiAssistantExtension extends Minz_Extension {
 			$entry->_content($entry->content() . $section);
 		} else {
 			$btn = '<button class="ai-load-transcript-btn" data-entry-id="' . $entryId . '">Load Transcript</button>';
+			$entry->_content($entry->content() . $btn);
+		}
+	}
+
+	/**
+	 * Append a collapsible full article section for feeds with fetch enabled.
+	 */
+	private function injectFullContentSection(FreshRSS_Entry $entry): void {
+		if ($this->isYoutube($entry) || !$this->shouldFetchFullContent($entry)) {
+			return;
+		}
+
+		$cached = $entry->attributes()['full_content'] ?? null;
+		$entryId = htmlspecialchars($entry->id());
+
+		if ($cached) {
+			$escaped = htmlspecialchars($cached);
+			$section = '<details class="ai-fullcontent-section">'
+				. '<summary>Full Article</summary>'
+				. '<div class="ai-fullcontent-content">' . nl2br($escaped) . '</div>'
+				. '</details>';
+			$entry->_content($entry->content() . $section);
+		} else {
+			$btn = '<button class="ai-load-fullcontent-btn" data-entry-id="' . $entryId . '">Load Full Article</button>';
 			$entry->_content($entry->content() . $btn);
 		}
 	}
@@ -511,6 +537,9 @@ class AiAssistantExtension extends Minz_Extension {
 				break;
 			case 'score_pending':
 				$this->ajaxScorePending();
+				break;
+			case 'fetch_full_content':
+				$this->ajaxFetchFullContent();
 				break;
 			default:
 				echo json_encode(['status' => 'error', 'message' => 'Unknown action']);
@@ -923,6 +952,28 @@ class AiAssistantExtension extends Minz_Extension {
 			echo json_encode(['status' => 'ok', 'transcript' => $transcript]);
 		} else {
 			echo json_encode(['status' => 'error', 'message' => 'Transcript unavailable']);
+		}
+	}
+
+	private function ajaxFetchFullContent(): void {
+		$entryId = self::jsonParam('entry_id');
+		if (!$entryId) {
+			echo json_encode(['status' => 'error', 'message' => 'No entry ID']);
+			return;
+		}
+
+		$entryDAO = FreshRSS_Factory::createEntryDao();
+		$entry = $entryDAO->searchById($entryId);
+		if (!$entry) {
+			echo json_encode(['status' => 'error', 'message' => 'Entry not found']);
+			return;
+		}
+
+		$content = $this->fetchFullContent($entry, $entryDAO);
+		if ($content) {
+			echo json_encode(['status' => 'ok', 'content' => $content]);
+		} else {
+			echo json_encode(['status' => 'error', 'message' => 'Could not fetch full content']);
 		}
 	}
 

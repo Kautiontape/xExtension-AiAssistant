@@ -390,6 +390,34 @@
 			});
 	}
 
+	// ── Load full content ───────────────────────────────────────────────────
+
+	function handleLoadFullContent(btn) {
+		var entryId = btn.dataset.entryId;
+		btn.disabled = true;
+		btn.textContent = "Loading\u2026";
+
+		ajaxPost("fetch_full_content", { entry_id: entryId })
+			.then(function (data) {
+				if (data.status === "ok" && data.content) {
+					var details = document.createElement("details");
+					details.className = "ai-fullcontent-section";
+					details.innerHTML =
+						"<summary>Full Article</summary>" +
+						'<div class="ai-fullcontent-content">' +
+						escapeHtml(data.content).replace(/\n/g, "<br>") +
+						"</div>";
+					btn.replaceWith(details);
+				} else {
+					btn.textContent = "Full content unavailable";
+				}
+			})
+			.catch(function () {
+				btn.textContent = "Failed to load";
+				btn.disabled = false;
+			});
+	}
+
 	// ── Chat modal ──────────────────────────────────────────────────────────
 
 	var chatOverlay = null;
@@ -592,6 +620,12 @@
 			var transcriptBtn = e.target.closest(".ai-load-transcript-btn");
 			if (transcriptBtn) {
 				handleLoadTranscript(transcriptBtn);
+				return;
+			}
+
+			var fullcontentBtn = e.target.closest(".ai-load-fullcontent-btn");
+			if (fullcontentBtn) {
+				handleLoadFullContent(fullcontentBtn);
 				return;
 			}
 		});
