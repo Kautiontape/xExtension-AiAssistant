@@ -184,6 +184,10 @@ final class AiAssistantExtension extends Minz_Extension {
 		if ($existing === null) {
 			return $entry;
 		}
+		// The hash FreshRSS stores must stay the one computed from the feed data,
+		// otherwise every refresh sees a "changed" entry. Setters like _tags()
+		// reset it, and hash() includes tags and (with enclosures) attributes.
+		$feedHash = $entry->hash();
 		$old = $existing->attributes();
 		$new = $entry->attributes();
 		foreach (self::AI_KEYS as $key) {
@@ -195,6 +199,7 @@ final class AiAssistantExtension extends Minz_Extension {
 		if ($oldTopics !== []) {
 			$entry->_tags(array_values(array_unique(array_merge($entry->tags(), $oldTopics))));
 		}
+		$entry->_hash($feedHash);
 		return $entry;
 	}
 
