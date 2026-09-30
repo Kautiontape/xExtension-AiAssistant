@@ -126,6 +126,29 @@
 			'<button class="ai-chat-btn">Chat</button>';
 	}
 
+	// ── Mirror the score badge into the collapsed header row ───────────────
+	// The badge lives in the article body (hidden until expanded); copy it next to
+	// the title so the list can be scanned without opening each entry.
+	function mirrorBadges(root) {
+		(root || document).querySelectorAll(".ai-assistant-container .ai-score-badge").forEach(function (badge) {
+			var container = badge.closest(".ai-assistant-container");
+			var flux = container && container.dataset.entryId ? document.getElementById("flux_" + container.dataset.entryId) : null;
+			if (!flux) return;
+			var slot = flux.querySelector(".flux_header .item.titleAuthorSummaryDate") || flux.querySelector(".flux_header");
+			if (!slot) return;
+			var mini = slot.querySelector(".ai-score-mini");
+			if (!mini) {
+				mini = document.createElement("span");
+				mini.className = "ai-score-mini";
+				var titleEl = slot.querySelector(".item-element.title");
+				if (titleEl) titleEl.prepend(mini); else slot.prepend(mini);
+			}
+			mini.className = "ai-score-mini " + badge.className.replace("ai-score-badge", "").trim();
+			mini.textContent = badge.textContent;
+			mini.title = badge.title || "";
+		});
+	}
+
 	// ── Score visible pending entries via the service ──────────────────────
 
 	function scorePendingEntries() {
@@ -195,6 +218,7 @@
 			'<button class="ai-feedback-btn" data-dir="less" title="Less like this">&minus;</button>';
 		el.innerHTML = html;
 		el.classList.remove("ai-score-pending");
+		mirrorBadges(el.closest(".flux") || document);
 	}
 
 	// ── Summarize (full) ───────────────────────────────────────────────────
@@ -404,11 +428,14 @@
 
 	// ── Event delegation ───────────────────────────────────────────────────
 
-	document.addEventListener("DOMContentLoaded", function () {
+	// FreshRSS loads extension scripts async, so DOMContentLoaded may already have fired.
+	function init() {
+		mirrorBadges();
 		scorePendingEntries();
 
 		// FreshRSS loads more entries as you scroll; score those too.
 		var observer = new MutationObserver(function () {
+			mirrorBadges();
 			if (document.querySelector(".ai-score-pending:not(.ai-scoring-requested)")) {
 				document.querySelectorAll(".ai-score-pending").forEach(function (el) { el.classList.add("ai-scoring-requested"); });
 				scorePendingEntries();
@@ -437,5 +464,11 @@
 		});
 
 		document.addEventListener("keydown", function (e) { if (e.key === "Escape" && chatOverlay) closeChatModal(); });
-	});
+	}
+
+	if (document.readyState === "loading") {
+		document.addEventListener("DOMContentLoaded", init);
+	} else {
+		init();
+	}
 })();
