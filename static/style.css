@@ -186,6 +186,8 @@
 .ai-chat-messages {
 	flex: 1;
 	overflow-y: auto;
+	overscroll-behavior: contain;
+	-webkit-overflow-scrolling: touch;
 	padding: 12px 16px;
 	display: flex;
 	flex-direction: column;
@@ -222,17 +224,26 @@
 
 .ai-chat-input-bar {
 	display: flex;
+	align-items: flex-end;
 	gap: 8px;
 	padding: 12px 16px;
 	border-top: 1px solid #e5e7eb;
 }
 
+/* One line that grows with the text (script.js caps it at five lines) */
 .ai-chat-input {
 	flex: 1;
+	box-sizing: border-box;
+	min-width: 0;
 	padding: 8px 12px;
 	border: 1px solid #d1d5db;
 	border-radius: 6px;
+	font-family: inherit;
 	font-size: 13px;
+	line-height: 20px;
+	min-height: 38px;
+	resize: none;
+	overflow-y: hidden;
 	outline: none;
 	color: inherit;
 	background: transparent;
@@ -261,6 +272,59 @@
 .ai-chat-send:disabled {
 	background: #93c5fd;
 	cursor: not-allowed;
+}
+
+/* No page scroll behind the chat window */
+html.ai-chat-open,
+html.ai-chat-open body {
+	overflow: hidden;
+}
+
+/* Phones: the chat takes the whole screen instead of floating as a modal */
+@media (max-width: 760px) {
+	.ai-chat-overlay {
+		align-items: stretch;
+		justify-content: stretch;
+		background: var(--ai-bg, #fff);
+	}
+	.ai-chat-modal {
+		width: 100%;
+		max-width: none;
+		height: 100%;
+		max-height: none;
+		border-radius: 0;
+		box-shadow: none;
+	}
+	.ai-chat-header {
+		padding: 10px 12px;
+		padding-top: calc(10px + env(safe-area-inset-top));
+	}
+	.ai-chat-close {
+		font-size: 28px;
+		padding: 0 6px 0 10px;
+	}
+	.ai-chat-messages {
+		padding: 12px;
+		min-height: 0;
+	}
+	.ai-chat-msg {
+		max-width: 92%;
+		font-size: 14px;
+	}
+	.ai-chat-input-bar {
+		padding: 10px 12px;
+		padding-bottom: calc(10px + env(safe-area-inset-bottom));
+	}
+	/* 16px stops iOS Safari from zooming the page when the box is focused */
+	.ai-chat-input {
+		font-size: 16px;
+		line-height: 22px;
+		min-height: 40px;
+	}
+	.ai-chat-send {
+		font-size: 14px;
+		min-height: 40px;
+	}
 }
 
 /* ── Transcript section ──────────────────────────────────────────────── */
@@ -366,7 +430,7 @@
 }
 
 @media (prefers-color-scheme: dark) {
-	.ai-chat-modal { --ai-bg: #1b1e25; --ai-fg: #e6e8ec; --ai-bubble: #262b35; }
+	.ai-chat-overlay, .ai-chat-modal { --ai-bg: #1b1e25; --ai-fg: #e6e8ec; --ai-bubble: #262b35; }
 	.ai-chat-header, .ai-chat-input-bar { border-color: #333a48; }
 	.ai-chat-model { background: #262b35; color: #e6e8ec; border-color: #333a48; }
 	.ai-chat-msg-user { background: #1e2a44; color: #cfe0ff; }

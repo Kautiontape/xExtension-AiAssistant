@@ -95,8 +95,9 @@
 		return formatRich(text);
 	}
 
-	// Re-render a streaming element at most once per animation frame
-	function liveRenderer(el, breaks) {
+	// Re-render a streaming element at most once per animation frame.
+	// `afterRender` runs once the new HTML is in the DOM (used for scroll pinning).
+	function liveRenderer(el, breaks, afterRender) {
 		var pending = false, latest = "", finished = false;
 		return function (text, done) {
 			latest = text; finished = !!done;
@@ -106,6 +107,7 @@
 				pending = false;
 				el.innerHTML = renderMarkdown(latest, breaks);
 				el.classList.toggle("ai-chat-cursor", !finished);
+				if (afterRender) afterRender();
 			});
 		};
 	}
@@ -327,7 +329,95 @@
 			.catch(function () { btn.textContent = "Failed to load"; btn.disabled = false; });
 	}
 
-	// ── Chat modal ─────────────────────────────────────────────────────────
+	// ── Browser history (phone back button) ────────────────────────────────
+	// Neither FreshRSS (opening an entry) nor this extension (opening the chat
+	// window) touches browser history, so on a phone the back button leaves
+	// FreshRSS entirely. Push a marker state for each and undo it on popstate.
+
+	var STATE_ENTRY = "aiEntry", STATE_CHAT = "aiChat";
+	var entryPushed = false;
+	var ignorePops = 0;
+	// What the history looked like before the latest change, so popstate can tell what was left.
+	// A marker is always pushed with the current URL, so going back off it lands on the same
+	// URL; FreshRSS's own hash pushes (location.hash = 'dropdown-…' / 'close') also fire popstate
+	// but change the URL, which is how the two are told apart.
+	var lastState = null, lastHref = "";
+
+	function isMarker(st, key) {
+		return !!(st && typeof st === "object" && st[key]);
+	}
+
+	function ownState(key) {
+		return isMarker(history.state, key);
+	}
+
+	function pushMarker(key) {
+		var st = {};
+		st[key] = true;
+		try { history.pushState(st, "", location.href); } catch (e) { return false; }
+		lastState = st;
+		lastHref = location.href;
+		return true;
+	}
+
+	// Remove our marker when it is on top of the stack (the resulting popstate is ignored).
+	// If FreshRSS pushed a hash entry (dropdown, slider) on top of ours, leave it alone.
+	function popMarker(key) {
+		if (!ownState(key)) return false;
+		ignorePops++;
+		history.back();
+		return true;
+	}
+
+	function collapseEntry(flux) {
+		if (typeof window.toggleContent === "function") window.toggleContent(flux, flux, false);
+		else flux.classList.remove("active");
+	}
+
+	function onFluxClassChange() {
+		var open = document.querySelector("#stream .flux.active") !== null;
+		if (open && !entryPushed) entryPushed = pushMarker(STATE_ENTRY);
+		else if (!open && entryPushed) { entryPushed = false; popMarker(STATE_ENTRY); }
+	}
+
+	function initHistory() {
+		var stream = document.getElementById("stream");
+		// Only where entries expand/collapse in place (the reader view shows everything open).
+		if (stream && !stream.classList.contains("reader")) {
+			new MutationObserver(function (mutations) {
+				for (var i = 0; i < mutations.length; i++) {
+					var t = mutations[i].target;
+					if (t.nodeType === 1 && t.classList.contains("flux")) { onFluxClassChange(); return; }
+				}
+			}).observe(stream, { attributes: true, attributeFilter: ["class"], subtree: true });
+			onFluxClassChange();
+		}
+		// Back on this page after leaving with an entry or the chat open: nothing is
+		// open any more, so a leftover marker must not swallow the next back press.
+		if (!entryPushed && (ownState(STATE_ENTRY) || ownState(STATE_CHAT))) {
+			try { history.replaceState(null, "", location.href); } catch (e) { /* ignore */ }
+		}
+		lastState = history.state;
+		lastHref = location.href;
+
+		// Act only when this event moved *back off* one of our markers: the previous state was
+		// the marker, the new one is not, and the URL is unchanged (see lastHref above).
+		window.addEventListener("popstate", function () {
+			var prev = lastState, sameUrl = location.href === lastHref;
+			lastState = history.state;
+			lastHref = location.href;
+			if (ignorePops > 0) { ignorePops--; return; }
+			if (!sameUrl) return;
+			if (chatOverlay && isMarker(prev, STATE_CHAT) && !ownState(STATE_CHAT)) closeChatModal(true);
+			if (isMarker(prev, STATE_ENTRY) && !ownState(STATE_ENTRY) && !ownState(STATE_CHAT)) {
+				entryPushed = false;
+				var flux = document.querySelector("#stream .flux.active");
+				if (flux) collapseEntry(flux);
+			}
+		});
+	}
+
+	// ── Chat window ────────────────────────────────────────────────────────
 
 	var chatOverlay = null;
 
@@ -336,12 +426,31 @@
 		var entryId = container.dataset.entryId;
 		var article = container.closest(".flux, .item, article, [id^='flux_']");
 		var titleEl = article ? article.querySelector(".title, .item-title, h2 a, h1 a, a.title") : null;
-		var title = titleEl ? titleEl.textContent.trim() : "Article";
-		openChatModal(entryId, title);
+		openChatModal(entryId, titleEl ? titleText(titleEl) : "Article");
+	}
+
+	// Title text without the score badge that mirrorBadges() puts inside the title element.
+	function titleText(el) {
+		var out = "";
+		el.childNodes.forEach(function (n) {
+			if (n.nodeType === 1 && n.classList.contains("ai-score-mini")) return;
+			out += n.textContent;
+		});
+		return out.replace(/\s+/g, " ").trim();
+	}
+
+	// Keep the window inside the visible part of the viewport: on phones the
+	// on-screen keyboard shrinks the visual viewport but not the layout viewport,
+	// so a plain position:fixed box would end up behind the keyboard.
+	function fitChatToViewport() {
+		var vv = window.visualViewport;
+		if (!chatOverlay || !vv) return;
+		chatOverlay.style.top = vv.offsetTop + "px";
+		chatOverlay.style.height = vv.height + "px";
 	}
 
 	function openChatModal(entryId, title) {
-		if (chatOverlay) chatOverlay.remove();
+		if (chatOverlay) closeChatModal();
 		chatOverlay = document.createElement("div");
 		chatOverlay.className = "ai-chat-overlay";
 		chatOverlay.innerHTML =
@@ -354,18 +463,46 @@
 			'<option value="claude-sonnet-5-5">Sonnet 5.5</option>' +
 			'<option value="claude-haiku-4-5">Haiku 4.5</option>' +
 			"</select>" +
-			'<button class="ai-chat-close">&times;</button></div></div>' +
+			'<button class="ai-chat-close" title="Close">&times;</button></div></div>' +
 			'<div class="ai-chat-messages"></div>' +
 			'<div class="ai-chat-input-bar">' +
-			'<input type="text" class="ai-chat-input" placeholder="Ask about this article…">' +
+			'<textarea class="ai-chat-input" rows="1" placeholder="Ask about this article…"></textarea>' +
 			'<button class="ai-chat-send">Send</button></div></div>';
 		document.body.appendChild(chatOverlay);
+		document.documentElement.classList.add("ai-chat-open");
+		pushMarker(STATE_CHAT);
+		if (window.visualViewport) {
+			window.visualViewport.addEventListener("resize", fitChatToViewport);
+			window.visualViewport.addEventListener("scroll", fitChatToViewport);
+			fitChatToViewport();
+		}
 
 		var messagesDiv = chatOverlay.querySelector(".ai-chat-messages");
 		var input = chatOverlay.querySelector(".ai-chat-input");
 		var sendBtn = chatOverlay.querySelector(".ai-chat-send");
 		var closeBtn = chatOverlay.querySelector(".ai-chat-close");
 		var modelSelect = chatOverlay.querySelector(".ai-chat-model");
+
+		// Follow the streamed reply only while the user is already at the bottom.
+		var stick = true;
+		messagesDiv.addEventListener("scroll", function () {
+			stick = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight < 40;
+		});
+		function scrollIfStuck() { if (stick) messagesDiv.scrollTop = messagesDiv.scrollHeight; }
+
+		// Grow the input from one line up to five as the text wraps.
+		function autosize() {
+			var cs = getComputedStyle(input);
+			var line = parseFloat(cs.lineHeight) || 20;
+			var extra = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0) +
+				(parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+			var max = line * 5 + extra;
+			input.style.height = "auto";
+			var wanted = input.scrollHeight + (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+			input.style.height = Math.min(wanted, max) + "px";
+			input.style.overflowY = wanted > max ? "auto" : "hidden";
+		}
+		input.addEventListener("input", autosize);
 
 		// Previous conversation about this entry, if any
 		ajaxPost("chat_history", { entry_id: entryId }).then(function (data) {
@@ -375,20 +512,21 @@
 		function send() {
 			var text = input.value.trim();
 			if (!text) return;
+			stick = true;
 			appendMessage(messagesDiv, "user", text);
 			input.value = "";
+			autosize();
 			sendBtn.disabled = true;
 			var msgDiv = appendMessage(messagesDiv, "assistant", "");
 			msgDiv.classList.add("ai-chat-thinking");
 			msgDiv.textContent = "Thinking…";
 			var fullText = "";
-			var render = liveRenderer(msgDiv, false);
+			var render = liveRenderer(msgDiv, false, scrollIfStuck);
 			streamPost("chat", { entry_id: entryId, message: text, model: modelSelect.value },
 				function onText(chunk) {
 					msgDiv.classList.remove("ai-chat-thinking");
 					fullText += chunk;
 					render(fullText, false);
-					messagesDiv.scrollTop = messagesDiv.scrollHeight;
 				},
 				function onDone() {
 					msgDiv.classList.remove("ai-chat-thinking");
@@ -399,17 +537,19 @@
 				function onError(msg) {
 					msgDiv.classList.remove("ai-chat-thinking");
 					msgDiv.textContent = "Error: " + (msg || "Request failed");
+					scrollIfStuck();
 					sendBtn.disabled = false;
 					input.focus();
 				},
-				function onStatus(status) { if (!fullText) msgDiv.textContent = status; }
+				function onStatus(status) { if (!fullText) { msgDiv.textContent = status; scrollIfStuck(); } }
 			);
 		}
 
 		sendBtn.addEventListener("click", send);
 		input.addEventListener("keydown", function (e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
-		closeBtn.addEventListener("click", closeChatModal);
+		closeBtn.addEventListener("click", function () { closeChatModal(); });
 		chatOverlay.addEventListener("click", function (e) { if (e.target === chatOverlay) closeChatModal(); });
+		autosize();
 		input.focus();
 	}
 
@@ -422,8 +562,17 @@
 		return div;
 	}
 
-	function closeChatModal() {
-		if (chatOverlay) { chatOverlay.remove(); chatOverlay = null; }
+	// `fromPop` is set when the back button already removed our history marker.
+	function closeChatModal(fromPop) {
+		if (!chatOverlay) return;
+		chatOverlay.remove();
+		chatOverlay = null;
+		document.documentElement.classList.remove("ai-chat-open");
+		if (window.visualViewport) {
+			window.visualViewport.removeEventListener("resize", fitChatToViewport);
+			window.visualViewport.removeEventListener("scroll", fitChatToViewport);
+		}
+		if (!fromPop) popMarker(STATE_CHAT);
 	}
 
 	// ── Event delegation ───────────────────────────────────────────────────
@@ -432,6 +581,7 @@
 	function init() {
 		mirrorBadges();
 		scorePendingEntries();
+		initHistory();
 
 		// FreshRSS loads more entries as you scroll; score those too.
 		var observer = new MutationObserver(function () {
