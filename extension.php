@@ -250,6 +250,7 @@ final class AiAssistantExtension extends Minz_Extension {
 	public function hookEntryBeforeDisplay(FreshRSS_Entry $entry): FreshRSS_Entry {
 		$attrs = $entry->attributes();
 		$entryId = htmlspecialchars((string) $entry->id(), ENT_QUOTES);
+		$this->cleanNewsletterAuthor($entry);
 
 		if (!isset($attrs['ai_score'])) {
 			// Not scored yet: the page script asks the service to score visible entries.
@@ -298,6 +299,20 @@ final class AiAssistantExtension extends Minz_Extension {
 		$this->injectTranscriptSection($entry);
 		$this->injectFullContentSection($entry);
 		return $entry;
+	}
+
+	/**
+	 * Email-to-RSS feeds (kill-the-newsletter) put the SMTP envelope sender in the
+	 * author field, e.g. "SRS0=abc=XY=ghost.example.com=bounce+...@srs.messagingengine.com".
+	 * Display-only: replace it with the feed name.
+	 */
+	private function cleanNewsletterAuthor(FreshRSS_Entry $entry): void {
+		$author = $entry->authors(true);
+		if ($author === '' || !preg_match('/^SRS\d=|@srs\.|=bounce[+@]|^bounce[+@-]/i', $author)) {
+			return;
+		}
+		$feed = $entry->feed();
+		$entry->_authors($feed !== null ? $feed->name() : '');
 	}
 
 	private function isYoutube(FreshRSS_Entry $entry): bool {

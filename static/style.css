@@ -399,3 +399,32 @@
 .ai-chat-msg img { max-width: 100%; }
 .ai-chat-cursor::after { content: "▍"; opacity: .6; animation: ai-blink 1s steps(2) infinite; }
 @keyframes ai-blink { to { opacity: 0; } }
+
+/* ── Email-newsletter content (kill-the-newsletter feeds) ─────────────── */
+/* Themes style every td with a border; newsletter HTML is nested layout tables. */
+.flux_content table[role="presentation"],
+.flux_content table:not(:has(th)) {
+	border: 0 !important;
+	border-collapse: collapse !important;
+	width: 100% !important;
+	max-width: 100% !important;
+	margin: 0 !important;
+	background: transparent !important;
+}
+.flux_content table[role="presentation"] td,
+.flux_content table[role="presentation"] th,
+.flux_content table:not(:has(th)) td {
+	border: 0 !important;
+	padding: 2px 0 !important;
+	background: transparent !important;
+	width: auto !important;
+}
+.flux_content td[align="center"] > div, .flux_content td[align="center"] > table { margin: 0 auto; }
+.flux_content img { max-width: 100% !important; height: auto; }
+/* Hidden preheader junk: tracking pixels and the run of soft hyphens that renders as stray dashes */
+.flux_content [data-sanitized-class="preheader"],
+.flux_content [data-sanitized-class="preheader-spacing"],
+.flux_content [data-sanitized-class*="preheader"],
+.flux_content img[width="1"][height="1"] {
+	display: none !important;
+}
