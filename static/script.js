@@ -81,6 +81,35 @@
 			.replace(/"/g, "&quot;");
 	}
 
+	// Markdown rendering (marked + DOMPurify are loaded by the extension; fall back to the simple formatter)
+	function renderMarkdown(text, breaks) {
+		if (window.marked && window.DOMPurify) {
+			try {
+				var html = DOMPurify.sanitize(marked.parse(text || "", { gfm: true, breaks: !!breaks }), { ADD_ATTR: ["target"] });
+				var tpl = document.createElement("template");
+				tpl.innerHTML = html;
+				tpl.content.querySelectorAll("a[href]").forEach(function (a) { a.target = "_blank"; a.rel = "noopener"; });
+				return tpl.innerHTML;
+			} catch (e) { /* fall through */ }
+		}
+		return formatRich(text);
+	}
+
+	// Re-render a streaming element at most once per animation frame
+	function liveRenderer(el, breaks) {
+		var pending = false, latest = "", finished = false;
+		return function (text, done) {
+			latest = text; finished = !!done;
+			if (pending) return;
+			pending = true;
+			requestAnimationFrame(function () {
+				pending = false;
+				el.innerHTML = renderMarkdown(latest, breaks);
+				el.classList.toggle("ai-chat-cursor", !finished);
+			});
+		};
+	}
+
 	function formatRich(text) {
 		// Minimal markdown: **bold**, `code`, [links](url), line breaks, simple bullets
 		var escaped = escapeHtml(text);
@@ -209,7 +238,7 @@
 		var entryId = container.dataset.entryId;
 		btn.disabled = true;
 		btn.textContent = "Loading…";
-		var detailDiv = null, fullText = "";
+		var detailDiv = null, fullText = "", render = null;
 		streamPost("detail", { entry_id: entryId },
 			function onText(text) {
 				fullText += text;
@@ -217,11 +246,12 @@
 					detailDiv = document.createElement("div");
 					detailDiv.className = "ai-detail";
 					container.appendChild(detailDiv);
+					render = liveRenderer(detailDiv, true);
 					btn.textContent = "Hide detail"; btn.className = "ai-detail-toggle"; btn.disabled = false;
 				}
-				detailDiv.textContent = fullText;
+				render(fullText, false);
 			},
-			function onDone() { if (detailDiv) detailDiv.innerHTML = formatRich(fullText); },
+			function onDone() { if (render) render(fullText, true); },
 			function onError(msg) { btn.textContent = "Failed"; btn.title = msg || ""; btn.disabled = false; }
 		);
 	}
@@ -296,8 +326,8 @@
 			'<div class="ai-chat-header-controls">' +
 			'<select class="ai-chat-model">' +
 			'<option value="">Default model</option>' +
-			'<option value="claude-opus-5">Opus 5</option>' +
-			'<option value="claude-sonnet-5">Sonnet 5</option>' +
+			'<option value="claude-opus-5-5">Opus 5.5</option>' +
+			'<option value="claude-sonnet-5-5">Sonnet 5.5</option>' +
 			'<option value="claude-haiku-4-5">Haiku 4.5</option>' +
 			"</select>" +
 			'<button class="ai-chat-close">&times;</button></div></div>' +
@@ -328,16 +358,17 @@
 			msgDiv.classList.add("ai-chat-thinking");
 			msgDiv.textContent = "Thinking…";
 			var fullText = "";
+			var render = liveRenderer(msgDiv, false);
 			streamPost("chat", { entry_id: entryId, message: text, model: modelSelect.value },
 				function onText(chunk) {
 					msgDiv.classList.remove("ai-chat-thinking");
 					fullText += chunk;
-					msgDiv.textContent = fullText;
+					render(fullText, false);
 					messagesDiv.scrollTop = messagesDiv.scrollHeight;
 				},
 				function onDone() {
 					msgDiv.classList.remove("ai-chat-thinking");
-					msgDiv.innerHTML = formatRich(fullText || "(no response)");
+					render(fullText || "(no response)", true);
 					sendBtn.disabled = false;
 					input.focus();
 				},
@@ -361,7 +392,7 @@
 	function appendMessage(container, role, text) {
 		var div = document.createElement("div");
 		div.className = "ai-chat-msg ai-chat-msg-" + role;
-		div.innerHTML = formatRich(text);
+		div.innerHTML = role === "user" ? escapeHtml(text).replace(/\n/g, "<br>") : renderMarkdown(text, false);
 		container.appendChild(div);
 		container.scrollTop = container.scrollHeight;
 		return div;

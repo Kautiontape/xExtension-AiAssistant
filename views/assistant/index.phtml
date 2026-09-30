@@ -1,0 +1,17 @@
+<?php
+declare(strict_types=1);
+/** @var FreshExtension_assistant_View $this */
+?>
+<div id="ai-assistant-page">
+	<?php if ($this->assistantUrl === '') { ?>
+		<p class="alert alert-warn">
+			The assistant service URL is not configured. Set <code>ASSISTANT_PUBLIC_URL</code> in the deploy
+			<code>.env</code> or fill it in under Extensions → AI Assistant.
+		</p>
+	<?php } else { ?>
+		<div class="ai-assistant-page-bar">
+			<a class="btn" href="<?= htmlspecialchars($this->publicUrl) ?>" target="_blank" rel="noopener">Open in a new tab</a>
+		</div>
+		<iframe id="ai-assistant-frame" src="<?= htmlspecialchars($this->assistantUrl) ?>" title="News Assistant" allow="clipboard-write"></iframe>
+	<?php } ?>
+</div>

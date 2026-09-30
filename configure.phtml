@@ -16,7 +16,7 @@ $csrfToken = FreshRSS_Auth::csrfToken();
 			Scoring, summaries, briefs and chat run in the <strong>assistant</strong> service. Interest profile,
 			models and per-feed rules are configured there.
 			<?php if ($this->publicUrl !== '') { ?>
-				<a class="btn btn-primary" href="<?= htmlspecialchars($this->publicUrl) ?>" target="_blank" rel="noopener">Open the assistant</a>
+				<a class="btn btn-primary" href="<?= _url('assistant', 'index') ?>">Open the assistant</a>
 			<?php } ?>
 		</p>
 		<p>

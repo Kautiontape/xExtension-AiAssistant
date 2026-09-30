@@ -40,8 +40,52 @@ final class AiAssistantExtension extends Minz_Extension {
 	public function init(): void {
 		$this->registerHook('entry_before_display', [$this, 'hookEntryBeforeDisplay']);
 		$this->registerHook('entry_before_update', [$this, 'hookEntryBeforeUpdate']);
+		$this->registerHook('nav_menu', [$this, 'hookNavMenu']);
+		$this->registerController('assistant');
+		$this->registerViews();
 		Minz_View::appendStyle($this->getFileUrl('style.css', 'css'));
+		Minz_View::appendScript($this->getFileUrl('marked.min.js', 'js'));
+		Minz_View::appendScript($this->getFileUrl('purify.min.js', 'js'));
 		Minz_View::appendScript($this->getFileUrl('script.js', 'js'));
+	}
+
+	/** Button in the top navigation bar that opens the Assistant page. */
+	public function hookNavMenu(): string {
+		if ($this->publicUrl() === '') {
+			return '';
+		}
+		$active = Minz_Request::controllerName() === 'assistant' ? ' active' : '';
+		return '<a class="btn ai-nav-btn' . $active . '" href="' . _url('assistant', 'index') . '" title="News Assistant">✨ Assistant</a>';
+	}
+
+	/** Public URL of the assistant UI for a hash route such as "chat" or "briefs/12". */
+	public function publicUrlForView(string $view = ''): string {
+		$base = $this->publicUrl();
+		if ($base === '') {
+			return '';
+		}
+		$route = $view !== '' ? '#/' . ltrim($view, '#/') : '#/chat';
+		return $base . '/' . $route;
+	}
+
+	/**
+	 * Single-sign-on URL: the service verifies an HMAC over a timestamp with the
+	 * shared internal token and sets its session cookie, so the FreshRSS user
+	 * never types the assistant password.
+	 */
+	public function ssoUrl(string $view = ''): string {
+		$base = $this->publicUrl();
+		if ($base === '') {
+			return '';
+		}
+		$token = $this->serviceToken();
+		$route = $view !== '' ? '#/' . ltrim($view, '#/') : '#/chat';
+		if ($token === '') {
+			return $base . '/' . $route;
+		}
+		$ts = (string) time();
+		$sig = hash_hmac('sha256', 'sso:' . $ts, $token);
+		return $base . '/sso?ts=' . $ts . '&sig=' . $sig . '&next=' . rawurlencode($route);
 	}
 
 	// ── Service connection ───────────────────────────────────────────────────
