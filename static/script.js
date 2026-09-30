@@ -2,7 +2,7 @@
 
 (function () {
 	var EXT_NAME = "AI Assistant";
-	var CHUNK_SIZE = 10;
+	var CHUNK_SIZE = 20;
 
 	function getAjaxUrl(action) {
 		var url = new URL(window.location.pathname, window.location.origin);
@@ -20,14 +20,12 @@
 			method: "POST",
 			headers: { "Content-Type": "application/json; charset=UTF-8" },
 			body: JSON.stringify(params),
-		}).then(function (r) {
-			return r.json();
-		});
+		}).then(function (r) { return r.json(); });
 	}
 
-	// ── Streaming fetch helper ──────────────────────────────────────────────
+	// ── Streaming helper (SSE frames: {text}, {status}, {error}, {done}) ─────
 
-	function streamPost(action, params, onText, onDone, onError) {
+	function streamPost(action, params, onText, onDone, onError, onStatus) {
 		params._csrf = context.csrf;
 		params.ajax = true;
 		fetch(getAjaxUrl(action), {
@@ -38,22 +36,19 @@
 			.then(function (r) {
 				var ct = r.headers.get("content-type") || "";
 				if (ct.indexOf("text/event-stream") === -1) {
-					// JSON response (error or cached result)
 					return r.json().then(function (data) {
-						if (data.status === "ok") {
-							onDone(data);
-						} else {
-							onError(data.message || "Request failed");
-						}
+						if (data.status === "ok") onDone(data);
+						else onError(data.message || "Request failed");
 					});
 				}
 				var reader = r.body.getReader();
 				var decoder = new TextDecoder();
 				var buffer = "";
+				var finished = false;
 				function pump() {
 					reader.read().then(function (result) {
 						if (result.done) {
-							onDone(null);
+							if (!finished) { finished = true; onDone(null); }
 							return;
 						}
 						buffer += decoder.decode(result.value, { stream: true });
@@ -64,241 +59,170 @@
 							if (!match) return;
 							try {
 								var evt = JSON.parse(match[1]);
-								if (evt.error) onError(evt.error);
+								if (evt.error) { finished = true; onError(evt.error); }
 								else if (evt.text) onText(evt.text);
-								else if (evt.done) onDone(null);
-							} catch (e) {
-								/* ignore parse errors */
-							}
+								else if (evt.status && onStatus) onStatus(evt.status);
+								else if (evt.done) { finished = true; onDone(evt); }
+							} catch (e) { /* ignore */ }
 						});
 						pump();
 					});
 				}
 				pump();
 			})
-			.catch(function () {
-				onError("Request failed");
-			});
-	}
-
-	// ── Chunked batch scoring ───────────────────────────────────────────────
-
-	function scorePendingEntries() {
-		var pending = document.querySelectorAll(".ai-score-pending");
-		if (!pending.length) return;
-
-		var ids = [];
-		var elMap = {};
-		pending.forEach(function (el) {
-			var id = el.dataset.entryId;
-			if (id) {
-				ids.push(id);
-				elMap[id] = el;
-			}
-		});
-		if (!ids.length) return;
-
-		// Show loading state on all (preserve action buttons)
-		pending.forEach(function (el) {
-			var statusEl = el.querySelector(".ai-scoring-status");
-			if (statusEl) {
-				statusEl.className = "ai-scoring-spinner";
-				statusEl.textContent = "Scoring\u2026";
-			} else {
-				el.innerHTML = '<span class="ai-scoring-spinner">Scoring\u2026</span>';
-			}
-		});
-
-		// 1 entry → score immediately; multiple → chunk into groups of CHUNK_SIZE
-		var chunks = [];
-		for (var i = 0; i < ids.length; i += CHUNK_SIZE) {
-			chunks.push(ids.slice(i, i + CHUNK_SIZE));
-		}
-
-		// Process chunks sequentially
-		function processChunk(index) {
-			if (index >= chunks.length) return;
-
-			var chunk = chunks[index];
-			ajaxPost("score_batch", { entry_ids: chunk })
-				.then(function (data) {
-					if (data.status !== "ok" || !data.scores) {
-						console.error("AI scoring failed:", data.message);
-						chunk.forEach(function (id) {
-							if (elMap[id]) {
-								elMap[id].innerHTML =
-									'<span class="ai-score-error">Score failed</span>' +
-									' <button class="ai-retry-score-btn">Retry</button>' +
-									' <button class="ai-summarize-btn">Summarize</button>' +
-									' <button class="ai-chat-btn">Chat</button>';
-							}
-						});
-					} else {
-						data.scores.forEach(function (s) {
-							var el = elMap[s.id];
-							if (!el) return;
-							renderScore(el, s);
-						});
-					}
-					processChunk(index + 1);
-				})
-				.catch(function (err) {
-					console.error("AI scoring request failed:", err);
-					chunk.forEach(function (id) {
-						if (elMap[id]) {
-							elMap[id].innerHTML =
-								'<span class="ai-score-error">Score failed</span>' +
-								' <button class="ai-retry-score-btn">Retry</button>' +
-								' <button class="ai-summarize-btn">Summarize</button>' +
-								' <button class="ai-chat-btn">Chat</button>';
-						}
-					});
-					processChunk(index + 1);
-				});
-		}
-
-		processChunk(0);
-	}
-
-	function renderScore(el, s) {
-		var colorClass =
-			s.score >= 7
-				? "ai-score-high"
-				: s.score >= 4
-					? "ai-score-mid"
-					: "ai-score-low";
-
-		var html =
-			'<span class="ai-score-badge ' +
-			colorClass +
-			'" title="' +
-			(s.reason || "").replace(/"/g, "&quot;") +
-			'">' +
-			s.score +
-			"</span>";
-
-		if (s.summary) {
-			html += '<span class="ai-summary">' + escapeHtml(s.summary) + "</span>";
-			html += '<button class="ai-detail-btn">More detail</button>';
-		} else {
-			html += '<button class="ai-summarize-btn">Summarize</button>';
-		}
-
-		html +=
-			'<button class="ai-chat-btn">Chat</button>' +
-			'<button class="ai-feedback-btn" data-dir="more" title="More like this">+</button>' +
-			'<button class="ai-feedback-btn" data-dir="less" title="Less like this">&minus;</button>';
-
-		el.innerHTML = html;
-		el.classList.remove("ai-score-pending");
+			.catch(function () { onError("Request failed"); });
 	}
 
 	function escapeHtml(str) {
-		return str
+		return String(str)
 			.replace(/&/g, "&amp;")
 			.replace(/</g, "&lt;")
 			.replace(/>/g, "&gt;")
 			.replace(/"/g, "&quot;");
 	}
 
-	// ── Summarize ────────────────────────────────────────────────────────────
+	function formatRich(text) {
+		// Minimal markdown: **bold**, `code`, [links](url), line breaks, simple bullets
+		var escaped = escapeHtml(text);
+		escaped = escaped.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+		escaped = escaped.replace(/`([^`]+)`/g, "<code>$1</code>");
+		escaped = escaped.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+		escaped = escaped.replace(/^\s*[-*]\s+(.*)$/gm, "&bull; $1");
+		return escaped.replace(/\n/g, "<br>");
+	}
+
+	function actionButtons(extra) {
+		return (extra || "") +
+			'<button class="ai-summarize-btn" data-force="1">Summarize</button>' +
+			'<button class="ai-chat-btn">Chat</button>';
+	}
+
+	// ── Score visible pending entries via the service ──────────────────────
+
+	function scorePendingEntries() {
+		var pending = document.querySelectorAll(".ai-score-pending");
+		if (!pending.length) return;
+		var ids = [], elMap = {};
+		pending.forEach(function (el) {
+			var id = el.dataset.entryId;
+			if (id && !elMap[id]) { ids.push(id); elMap[id] = el; }
+		});
+		if (!ids.length) return;
+
+		pending.forEach(function (el) {
+			var statusEl = el.querySelector(".ai-scoring-status");
+			if (statusEl) { statusEl.className = "ai-scoring-status ai-scoring-spinner"; statusEl.textContent = "Scoring…"; }
+		});
+
+		var chunks = [];
+		for (var i = 0; i < ids.length; i += CHUNK_SIZE) chunks.push(ids.slice(i, i + CHUNK_SIZE));
+
+		function fail(chunk, message) {
+			chunk.forEach(function (id) {
+				var el = elMap[id];
+				if (!el) return;
+				el.innerHTML = '<span class="ai-score-error" title="' + escapeHtml(message || "") + '">Score failed</span>' +
+					' <button class="ai-retry-score-btn">Retry</button> ' + actionButtons();
+			});
+		}
+
+		function processChunk(index) {
+			if (index >= chunks.length) return;
+			var chunk = chunks[index];
+			ajaxPost("score_batch", { entry_ids: chunk })
+				.then(function (data) {
+					if (data.status !== "ok" || !data.scores) { fail(chunk, data.message); }
+					else {
+						chunk.forEach(function (id) {
+							var el = elMap[id];
+							if (!el) return;
+							if (data.scores[id]) renderScore(el, id, data.scores[id]);
+							else if ((data.skipped || []).indexOf(id) !== -1) {
+								// Feed not enabled for scoring: just leave the action buttons
+								el.classList.remove("ai-score-pending");
+								var s = el.querySelector(".ai-scoring-status");
+								if (s) s.remove();
+							} else fail([id], "not scored");
+						});
+					}
+					processChunk(index + 1);
+				})
+				.catch(function () { fail(chunk, "request failed"); processChunk(index + 1); });
+		}
+		processChunk(0);
+	}
+
+	function renderScore(el, id, s) {
+		var score = Number(s.score);
+		var colorClass = score >= 7 ? "ai-score-high" : score >= 4 ? "ai-score-mid" : "ai-score-low";
+		var html = '<span class="ai-score-badge ' + colorClass + '" title="' + escapeHtml(s.reason || "") + '">' + score + "</span>";
+		if (s.summary) html += '<span class="ai-summary">' + escapeHtml(s.summary) + "</span>";
+		if (score > 0) {
+			html += '<button class="ai-summarize-btn" data-force="1" title="Write a full summary from the whole text">' + (s.summary ? "Full summary" : "Summarize") + "</button>";
+			html += '<button class="ai-detail-btn">More detail</button>';
+		}
+		html += '<button class="ai-chat-btn">Chat</button>' +
+			'<button class="ai-feedback-btn" data-dir="more" title="More like this">+</button>' +
+			'<button class="ai-feedback-btn" data-dir="less" title="Less like this">&minus;</button>';
+		el.innerHTML = html;
+		el.classList.remove("ai-score-pending");
+	}
+
+	// ── Summarize (full) ───────────────────────────────────────────────────
 
 	function handleSummarize(btn) {
 		var container = btn.closest(".ai-assistant-container");
 		var entryId = container.dataset.entryId;
-
+		var existing = container.querySelector(".ai-summary");
 		btn.disabled = true;
-		btn.textContent = "Summarizing\u2026";
-
+		btn.textContent = "Summarizing…";
 		var span = null;
-
-		streamPost(
-			"summarize",
-			{ entry_id: entryId },
-			function onText(text) {
+		var text = "";
+		streamPost("summarize", { entry_id: entryId, force: btn.dataset.force === "1" },
+			function onText(chunk) {
+				text += chunk;
 				if (!span) {
-					span = document.createElement("span");
+					span = existing || document.createElement("span");
 					span.className = "ai-summary";
-					btn.replaceWith(span);
+					if (!existing) btn.before(span);
 				}
-				span.textContent += text;
+				span.textContent = text;
 			},
-			function onDone(data) {
-				// Handle cached JSON response (non-streaming)
-				if (data && data.summary) {
-					if (!span) {
-						span = document.createElement("span");
-						span.className = "ai-summary";
-						btn.replaceWith(span);
-					}
-					span.textContent = data.summary;
-				}
+			function onDone() {
 				if (span) {
-					var detailBtn = document.createElement("button");
-					detailBtn.className = "ai-detail-btn";
-					detailBtn.textContent = "More detail";
-					span.after(detailBtn);
-				}
+					btn.remove();
+					if (!container.querySelector(".ai-detail-btn, .ai-detail-toggle")) {
+						var d = document.createElement("button");
+						d.className = "ai-detail-btn"; d.textContent = "More detail";
+						span.after(d);
+					}
+				} else { btn.textContent = "Summarize"; btn.disabled = false; }
 			},
-			function onError() {
-				if (!span) {
-					btn.textContent = "Failed";
-					btn.disabled = false;
-				}
-			},
+			function onError(msg) { btn.textContent = "Failed"; btn.title = msg || ""; btn.disabled = false; }
 		);
 	}
 
-	// ── Detail ──────────────────────────────────────────────────────────────
+	// ── Detail ─────────────────────────────────────────────────────────────
 
 	function handleDetail(btn) {
 		var container = btn.closest(".ai-assistant-container");
 		var entryId = container.dataset.entryId;
-
 		btn.disabled = true;
-		btn.textContent = "Loading\u2026";
-
-		var detailDiv = null;
-		var fullText = "";
-
-		streamPost(
-			"detail",
-			{ entry_id: entryId },
+		btn.textContent = "Loading…";
+		var detailDiv = null, fullText = "";
+		streamPost("detail", { entry_id: entryId },
 			function onText(text) {
 				fullText += text;
 				if (!detailDiv) {
 					detailDiv = document.createElement("div");
 					detailDiv.className = "ai-detail";
 					container.appendChild(detailDiv);
-					btn.textContent = "Hide detail";
-					btn.className = "ai-detail-toggle";
-					btn.disabled = false;
+					btn.textContent = "Hide detail"; btn.className = "ai-detail-toggle"; btn.disabled = false;
 				}
-				// Show raw text while streaming, format on done
 				detailDiv.textContent = fullText;
-				detailDiv.scrollIntoView({ block: "nearest" });
 			},
-			function onDone(data) {
-				// Handle cached JSON response
-				if (data && data.detail) {
-					fullText = data.detail;
-					if (!detailDiv) {
-						detailDiv = document.createElement("div");
-						detailDiv.className = "ai-detail";
-						container.appendChild(detailDiv);
-					}
-					btn.textContent = "Hide detail";
-					btn.className = "ai-detail-toggle";
-					btn.disabled = false;
-				}
-				if (detailDiv) {
-					detailDiv.innerHTML = formatDetail(fullText);
-				}
-			},
-			function onError() {
-				btn.textContent = "Failed";
-				btn.disabled = false;
-			},
+			function onDone() { if (detailDiv) detailDiv.innerHTML = formatRich(fullText); },
+			function onError(msg) { btn.textContent = "Failed"; btn.title = msg || ""; btn.disabled = false; }
 		);
 	}
 
@@ -306,179 +230,81 @@
 		var container = btn.closest(".ai-assistant-container");
 		var detailDiv = container.querySelector(".ai-detail");
 		if (!detailDiv) return;
-
-		if (detailDiv.style.display === "none") {
-			detailDiv.style.display = "";
-			btn.textContent = "Hide detail";
-		} else {
-			detailDiv.style.display = "none";
-			btn.textContent = "More detail";
-		}
+		var hidden = detailDiv.style.display === "none";
+		detailDiv.style.display = hidden ? "" : "none";
+		btn.textContent = hidden ? "Hide detail" : "More detail";
 	}
 
-	function formatDetail(text) {
-		// Escape HTML
-		var escaped = text
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;");
-		// Convert **Title** to <strong>Title</strong>
-		escaped = escaped.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-		// Convert newlines to <br>
-		return escaped.replace(/\n/g, "<br>");
-	}
-
-	// ── Feedback ─────────────────────────────────────────────────────────────
+	// ── Feedback (+ / −) ───────────────────────────────────────────────────
 
 	function handleFeedback(btn) {
 		var container = btn.closest(".ai-assistant-container");
 		var entryId = container.dataset.entryId;
 		var direction = btn.dataset.dir;
-
-		var reason = prompt(
-			direction === "more"
-				? "Why should articles like this score higher?"
-				: "Why should articles like this score lower?",
-		);
+		var reason = prompt(direction === "more" ? "Why should articles like this score higher?" : "Why should articles like this score lower?");
 		if (reason === null) return;
-
 		btn.disabled = true;
-
-		ajaxPost("feedback", {
-			entry_id: entryId,
-			direction: direction,
-			reason: reason,
-		})
+		btn.textContent = "…";
+		ajaxPost("feedback", { entry_id: entryId, direction: direction, reason: reason })
 			.then(function (data) {
-				if (data.status === "ok") {
-					btn.textContent = "\u2713";
-					btn.classList.add("confirmed");
-				} else {
-					btn.disabled = false;
-				}
+				if (data.status === "ok") { btn.textContent = "✓"; btn.classList.add("confirmed"); }
+				else { btn.textContent = direction === "more" ? "+" : "−"; btn.title = data.message || "Failed"; btn.disabled = false; }
 			})
-			.catch(function () {
-				btn.disabled = false;
-			});
+			.catch(function () { btn.textContent = direction === "more" ? "+" : "−"; btn.disabled = false; });
 	}
 
-	// ── Load transcript ─────────────────────────────────────────────────────
+	// ── Transcript / full content ──────────────────────────────────────────
 
-	function handleLoadTranscript(btn) {
+	function handleLoad(btn, action, key, cls, label) {
 		var entryId = btn.dataset.entryId;
 		btn.disabled = true;
-		btn.textContent = "Loading\u2026";
-
-		ajaxPost("fetch_transcript", { entry_id: entryId })
+		btn.textContent = "Loading…";
+		ajaxPost(action, { entry_id: entryId })
 			.then(function (data) {
-				if (data.status === "ok" && data.transcript) {
+				if (data.status === "ok" && data[key]) {
 					var details = document.createElement("details");
-					details.className = "ai-transcript-section";
-					details.innerHTML =
-						"<summary>Video Transcript</summary>" +
-						'<div class="ai-transcript-content">' +
-						escapeHtml(data.transcript).replace(/\n/g, "<br>") +
-						"</div>";
+					details.className = cls + "-section";
+					details.open = true;
+					details.innerHTML = "<summary>" + label + "</summary><div class=\"" + cls + "-content\">" +
+						escapeHtml(data[key]).replace(/\n/g, "<br>") + "</div>";
 					btn.replaceWith(details);
-				} else {
-					btn.textContent = "Transcript unavailable";
-				}
+				} else { btn.textContent = data.message || "Unavailable"; }
 			})
-			.catch(function () {
-				btn.textContent = "Failed to load";
-				btn.disabled = false;
-			});
+			.catch(function () { btn.textContent = "Failed to load"; btn.disabled = false; });
 	}
 
-	// ── Load full content ───────────────────────────────────────────────────
-
-	function handleLoadFullContent(btn) {
-		var entryId = btn.dataset.entryId;
-		btn.disabled = true;
-		btn.textContent = "Loading\u2026";
-
-		ajaxPost("fetch_full_content", { entry_id: entryId })
-			.then(function (data) {
-				if (data.status === "ok" && data.content) {
-					var details = document.createElement("details");
-					details.className = "ai-fullcontent-section";
-					details.innerHTML =
-						"<summary>Full Article</summary>" +
-						'<div class="ai-fullcontent-content">' +
-						escapeHtml(data.content).replace(/\n/g, "<br>") +
-						"</div>";
-					btn.replaceWith(details);
-				} else {
-					btn.textContent = "Full content unavailable";
-				}
-			})
-			.catch(function () {
-				btn.textContent = "Failed to load";
-				btn.disabled = false;
-			});
-	}
-
-	// ── Chat modal ──────────────────────────────────────────────────────────
+	// ── Chat modal ─────────────────────────────────────────────────────────
 
 	var chatOverlay = null;
 
 	function handleChat(btn) {
 		var container = btn.closest(".ai-assistant-container");
 		var entryId = container.dataset.entryId;
-
-		// Find article title from the entry
 		var article = container.closest(".flux, .item, article, [id^='flux_']");
-		var titleEl = article
-			? article.querySelector(".title, .item-title, h2 a, h1 a, a.title")
-			: null;
+		var titleEl = article ? article.querySelector(".title, .item-title, h2 a, h1 a, a.title") : null;
 		var title = titleEl ? titleEl.textContent.trim() : "Article";
-
-		// Gather existing context from DOM
-		var summaryEl = container.querySelector(".ai-summary");
-		var detailEl = container.querySelector(".ai-detail");
-		var initialMessages = [];
-		if (summaryEl) {
-			initialMessages.push({
-				role: "assistant",
-				content: "Summary: " + summaryEl.textContent,
-			});
-		}
-		if (detailEl) {
-			initialMessages.push({
-				role: "assistant",
-				content: detailEl.textContent,
-			});
-		}
-
-		openChatModal(entryId, title, initialMessages);
+		openChatModal(entryId, title);
 	}
 
-	function openChatModal(entryId, title, initialMessages) {
+	function openChatModal(entryId, title) {
 		if (chatOverlay) chatOverlay.remove();
-
 		chatOverlay = document.createElement("div");
 		chatOverlay.className = "ai-chat-overlay";
 		chatOverlay.innerHTML =
 			'<div class="ai-chat-modal">' +
-			'<div class="ai-chat-header">' +
-			'<span class="ai-chat-title">' +
-			escapeHtml(title) +
-			"</span>" +
+			'<div class="ai-chat-header"><span class="ai-chat-title">' + escapeHtml(title) + "</span>" +
 			'<div class="ai-chat-header-controls">' +
 			'<select class="ai-chat-model">' +
-			'<option value="claude-sonnet-4-6">Sonnet 4.6</option>' +
-			'<option value="claude-haiku-4-5-20251001">Haiku 4.5</option>' +
+			'<option value="">Default model</option>' +
+			'<option value="claude-opus-5">Opus 5</option>' +
+			'<option value="claude-sonnet-5">Sonnet 5</option>' +
+			'<option value="claude-haiku-4-5">Haiku 4.5</option>' +
 			"</select>" +
-			'<button class="ai-chat-close">&times;</button>' +
-			"</div>" +
-			"</div>" +
+			'<button class="ai-chat-close">&times;</button></div></div>' +
 			'<div class="ai-chat-messages"></div>' +
 			'<div class="ai-chat-input-bar">' +
-			'<input type="text" class="ai-chat-input" placeholder="Ask about this article\u2026">' +
-			'<button class="ai-chat-send">Send</button>' +
-			"</div>" +
-			"</div>";
-
+			'<input type="text" class="ai-chat-input" placeholder="Ask about this article…">' +
+			'<button class="ai-chat-send">Send</button></div></div>';
 		document.body.appendChild(chatOverlay);
 
 		var messagesDiv = chatOverlay.querySelector(".ai-chat-messages");
@@ -487,30 +313,22 @@
 		var closeBtn = chatOverlay.querySelector(".ai-chat-close");
 		var modelSelect = chatOverlay.querySelector(".ai-chat-model");
 
-		// Show initial context messages
-		initialMessages.forEach(function (m) {
-			appendMessage(messagesDiv, m.role, m.content);
-		});
+		// Previous conversation about this entry, if any
+		ajaxPost("chat_history", { entry_id: entryId }).then(function (data) {
+			(data.messages || []).forEach(function (m) { appendMessage(messagesDiv, m.role, m.text); });
+		}).catch(function () {});
 
 		function send() {
 			var text = input.value.trim();
 			if (!text) return;
-
 			appendMessage(messagesDiv, "user", text);
 			input.value = "";
 			sendBtn.disabled = true;
-
 			var msgDiv = appendMessage(messagesDiv, "assistant", "");
 			msgDiv.classList.add("ai-chat-thinking");
+			msgDiv.textContent = "Thinking…";
 			var fullText = "";
-
-			streamPost(
-				"chat",
-				{
-					entry_id: entryId,
-					message: text,
-					model: modelSelect.value,
-				},
+			streamPost("chat", { entry_id: entryId, message: text, model: modelSelect.value },
 				function onText(chunk) {
 					msgDiv.classList.remove("ai-chat-thinking");
 					fullText += chunk;
@@ -519,9 +337,7 @@
 				},
 				function onDone() {
 					msgDiv.classList.remove("ai-chat-thinking");
-					if (fullText) {
-						msgDiv.innerHTML = formatChatMessage(fullText);
-					}
+					msgDiv.innerHTML = formatRich(fullText || "(no response)");
 					sendBtn.disabled = false;
 					input.focus();
 				},
@@ -531,109 +347,64 @@
 					sendBtn.disabled = false;
 					input.focus();
 				},
+				function onStatus(status) { if (!fullText) msgDiv.textContent = status; }
 			);
 		}
 
 		sendBtn.addEventListener("click", send);
-		input.addEventListener("keydown", function (e) {
-			if (e.key === "Enter" && !e.shiftKey) {
-				e.preventDefault();
-				send();
-			}
-		});
-
+		input.addEventListener("keydown", function (e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
 		closeBtn.addEventListener("click", closeChatModal);
-		chatOverlay.addEventListener("click", function (e) {
-			if (e.target === chatOverlay) closeChatModal();
-		});
-
+		chatOverlay.addEventListener("click", function (e) { if (e.target === chatOverlay) closeChatModal(); });
 		input.focus();
 	}
 
 	function appendMessage(container, role, text) {
 		var div = document.createElement("div");
 		div.className = "ai-chat-msg ai-chat-msg-" + role;
-		div.innerHTML = formatChatMessage(text);
+		div.innerHTML = formatRich(text);
 		container.appendChild(div);
 		container.scrollTop = container.scrollHeight;
 		return div;
 	}
 
-	function formatChatMessage(text) {
-		var escaped = escapeHtml(text);
-		escaped = escaped.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-		return escaped.replace(/\n/g, "<br>");
-	}
-
 	function closeChatModal() {
-		if (chatOverlay) {
-			chatOverlay.remove();
-			chatOverlay = null;
-		}
+		if (chatOverlay) { chatOverlay.remove(); chatOverlay = null; }
 	}
 
-	// ── Event delegation ─────────────────────────────────────────────────────
+	// ── Event delegation ───────────────────────────────────────────────────
 
 	document.addEventListener("DOMContentLoaded", function () {
 		scorePendingEntries();
 
+		// FreshRSS loads more entries as you scroll; score those too.
+		var observer = new MutationObserver(function () {
+			if (document.querySelector(".ai-score-pending:not(.ai-scoring-requested)")) {
+				document.querySelectorAll(".ai-score-pending").forEach(function (el) { el.classList.add("ai-scoring-requested"); });
+				scorePendingEntries();
+			}
+		});
+		document.querySelectorAll(".ai-score-pending").forEach(function (el) { el.classList.add("ai-scoring-requested"); });
+		var stream = document.getElementById("stream");
+		if (stream) observer.observe(stream, { childList: true, subtree: false });
+
 		document.addEventListener("click", function (e) {
-			var retryBtn = e.target.closest(".ai-retry-score-btn");
-			if (retryBtn) {
-				var container = retryBtn.closest(".ai-assistant-container");
-				container.classList.add("ai-score-pending");
-				container.innerHTML = "";
+			var t;
+			if ((t = e.target.closest(".ai-retry-score-btn"))) {
+				var c = t.closest(".ai-assistant-container");
+				c.classList.add("ai-score-pending");
+				c.innerHTML = '<span class="ai-scoring-status"></span>';
 				scorePendingEntries();
 				return;
 			}
-
-			var chatBtn = e.target.closest(".ai-chat-btn");
-			if (chatBtn) {
-				handleChat(chatBtn);
-				return;
-			}
-
-			var summarizeBtn = e.target.closest(".ai-summarize-btn");
-			if (summarizeBtn) {
-				handleSummarize(summarizeBtn);
-				return;
-			}
-
-			var detailBtn = e.target.closest(".ai-detail-btn");
-			if (detailBtn) {
-				handleDetail(detailBtn);
-				return;
-			}
-
-			var toggleBtn = e.target.closest(".ai-detail-toggle");
-			if (toggleBtn) {
-				handleDetailToggle(toggleBtn);
-				return;
-			}
-
-			var feedbackBtn = e.target.closest(".ai-feedback-btn");
-			if (feedbackBtn) {
-				handleFeedback(feedbackBtn);
-				return;
-			}
-
-			var transcriptBtn = e.target.closest(".ai-load-transcript-btn");
-			if (transcriptBtn) {
-				handleLoadTranscript(transcriptBtn);
-				return;
-			}
-
-			var fullcontentBtn = e.target.closest(".ai-load-fullcontent-btn");
-			if (fullcontentBtn) {
-				handleLoadFullContent(fullcontentBtn);
-				return;
-			}
+			if ((t = e.target.closest(".ai-chat-btn"))) { handleChat(t); return; }
+			if ((t = e.target.closest(".ai-summarize-btn"))) { handleSummarize(t); return; }
+			if ((t = e.target.closest(".ai-detail-btn"))) { handleDetail(t); return; }
+			if ((t = e.target.closest(".ai-detail-toggle"))) { handleDetailToggle(t); return; }
+			if ((t = e.target.closest(".ai-feedback-btn"))) { handleFeedback(t); return; }
+			if ((t = e.target.closest(".ai-load-transcript-btn"))) { handleLoad(t, "fetch_transcript", "transcript", "ai-transcript", "Video transcript"); return; }
+			if ((t = e.target.closest(".ai-load-fullcontent-btn"))) { handleLoad(t, "fetch_full_content", "content", "ai-fullcontent", "Full article (fetched)"); return; }
 		});
 
-		document.addEventListener("keydown", function (e) {
-			if (e.key === "Escape" && chatOverlay) {
-				closeChatModal();
-			}
-		});
+		document.addEventListener("keydown", function (e) { if (e.key === "Escape" && chatOverlay) closeChatModal(); });
 	});
 })();

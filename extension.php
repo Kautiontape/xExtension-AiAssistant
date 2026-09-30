@@ -1,1269 +1,390 @@
 <?php
 
-class AiAssistantExtension extends Minz_Extension {
+declare(strict_types=1);
+
+/**
+ * AI Assistant extension.
+ *
+ * Thin display layer over the `assistant` service (see ../assistant in the
+ * deploy repo). The service scores entries in the background and stores the
+ * results in the entry attributes this extension renders. On-demand actions
+ * (summarize, detail, chat, feedback, transcript, full content) are proxied to
+ * the service so all prompts and model settings live in one place.
+ */
+final class AiAssistantExtension extends Minz_Extension {
+
+	/** Attribute keys written by the service that must survive entry updates. */
+	private const AI_KEYS = ['ai_score', 'ai_score_reason', 'ai_summary', 'ai_summary_full', 'ai_detail',
+		'yt_transcript', 'yt_is_short', 'yt_duration', 'full_content'];
+	private const TOPIC_PREFIX = 'ai/';
 
 	private static ?array $jsonInput = null;
 
+	public string $serviceUrl = '';
+	public string $publicUrl = '';
+	public bool $tokenFromEnv = false;
+	public bool $tokenConfigured = false;
+
 	private static function jsonParam(string $key): mixed {
 		if (self::$jsonInput === null) {
-			self::$jsonInput = json_decode(file_get_contents('php://input'), true) ?: [];
+			$raw = file_get_contents('php://input');
+			$decoded = $raw ? json_decode($raw, true) : null;
+			self::$jsonInput = is_array($decoded) ? $decoded : [];
 		}
 		return self::$jsonInput[$key] ?? '';
 	}
 
 	// ── Lifecycle ────────────────────────────────────────────────────────────
 
+	#[\Override]
 	public function init(): void {
-		$this->registerHook('entry_before_insert', [$this, 'hookEntryBeforeInsert']);
 		$this->registerHook('entry_before_display', [$this, 'hookEntryBeforeDisplay']);
+		$this->registerHook('entry_before_update', [$this, 'hookEntryBeforeUpdate']);
 		Minz_View::appendStyle($this->getFileUrl('style.css', 'css'));
 		Minz_View::appendScript($this->getFileUrl('script.js', 'js'));
 	}
 
+	// ── Service connection ───────────────────────────────────────────────────
+
+	private function serviceUrl(): string {
+		$url = (string) ($this->getUserConfigurationValue('assistant_url') ?? '');
+		if ($url === '') {
+			$url = (string) (getenv('ASSISTANT_URL') ?: 'http://assistant:8000');
+		}
+		return rtrim($url, '/');
+	}
+
+	private function serviceToken(): string {
+		$token = (string) ($this->getUserConfigurationValue('assistant_token') ?? '');
+		if ($token === '') {
+			$token = (string) (getenv('ASSISTANT_INTERNAL_TOKEN') ?: '');
+		}
+		return $token;
+	}
+
+	private function publicUrl(): string {
+		$url = (string) ($this->getUserConfigurationValue('assistant_public_url') ?? '');
+		if ($url === '') {
+			$url = (string) (getenv('ASSISTANT_PUBLIC_URL') ?: '');
+		}
+		return rtrim($url, '/');
+	}
+
+	/**
+	 * JSON request to the service. Returns [httpCode, decodedBody|null].
+	 * @return array{0:int,1:?array}
+	 */
+	private function serviceJson(string $method, string $path, ?array $body = null, int $timeout = 120): array {
+		$ch = curl_init($this->serviceUrl() . $path);
+		$headers = ['Accept: application/json', 'X-Assistant-Token: ' . $this->serviceToken()];
+		$opts = [
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_CONNECTTIMEOUT => 5,
+			CURLOPT_TIMEOUT => $timeout,
+			CURLOPT_CUSTOMREQUEST => $method,
+		];
+		if ($body !== null) {
+			$headers[] = 'Content-Type: application/json';
+			$opts[CURLOPT_POSTFIELDS] = json_encode($body);
+		}
+		$opts[CURLOPT_HTTPHEADER] = $headers;
+		curl_setopt_array($ch, $opts);
+		$response = curl_exec($ch);
+		$code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		$err = curl_error($ch);
+		curl_close($ch);
+		if ($response === false) {
+			Minz_Log::warning('AiAssistant: service unreachable: ' . $err);
+			return [0, ['detail' => 'assistant service unreachable: ' . $err]];
+		}
+		$decoded = json_decode((string) $response, true);
+		return [$code, is_array($decoded) ? $decoded : null];
+	}
+
+	/** Pass a Server-Sent-Events stream from the service straight through to the browser. */
+	private function serviceStream(string $path, array $body): void {
+		$this->beginSSE();
+		$status = 0;
+		$errBody = '';
+		$ch = curl_init($this->serviceUrl() . $path);
+		curl_setopt_array($ch, [
+			CURLOPT_POST => true,
+			CURLOPT_HTTPHEADER => [
+				'Content-Type: application/json',
+				'Accept: text/event-stream',
+				'X-Assistant-Token: ' . $this->serviceToken(),
+			],
+			CURLOPT_POSTFIELDS => json_encode($body),
+			CURLOPT_RETURNTRANSFER => false,
+			CURLOPT_CONNECTTIMEOUT => 5,
+			CURLOPT_TIMEOUT => 600,
+			CURLOPT_HEADERFUNCTION => static function ($ch, string $header) use (&$status): int {
+				if (preg_match('#^HTTP/\S+\s+(\d{3})#', $header, $m)) {
+					$status = (int) $m[1];
+				}
+				return strlen($header);
+			},
+			CURLOPT_WRITEFUNCTION => static function ($ch, string $data) use (&$status, &$errBody): int {
+				if ($status !== 0 && $status !== 200) {
+					$errBody .= $data;
+					return strlen($data);
+				}
+				echo $data;
+				flush();
+				return strlen($data);
+			},
+		]);
+		$ok = curl_exec($ch);
+		$err = curl_error($ch);
+		curl_close($ch);
+		if ($ok === false) {
+			$this->sendSSE(['error' => 'assistant service unreachable: ' . $err]);
+		} elseif ($status !== 200) {
+			$decoded = json_decode($errBody, true);
+			$msg = is_array($decoded) && isset($decoded['detail']) ? (string) $decoded['detail'] : "service error (HTTP {$status})";
+			$this->sendSSE(['error' => $msg]);
+		}
+	}
+
+	private function beginSSE(): void {
+		header('Content-Type: text/event-stream');
+		header('Cache-Control: no-cache');
+		header('X-Accel-Buffering: no');
+		while (ob_get_level()) {
+			ob_end_flush();
+		}
+		flush();
+	}
+
+	private function sendSSE(array $frame): void {
+		echo 'data: ' . json_encode($frame) . "\n\n";
+		flush();
+	}
+
+	private function jsonOut(array $data, int $code = 200): void {
+		http_response_code($code);
+		header('Content-Type: application/json');
+		echo json_encode($data);
+	}
+
 	// ── Hooks ────────────────────────────────────────────────────────────────
 
-	public function hookEntryBeforeInsert(FreshRSS_Entry $entry): FreshRSS_Entry {
-		if ($this->shouldScore($entry)) {
-			$entry->_attribute('ai_needs_scoring', true);
+	/**
+	 * FreshRSS overwrites `attributes` and `tags` wholesale when a feed republishes
+	 * an entry. Re-merge everything the service wrote so scores survive updates.
+	 */
+	public function hookEntryBeforeUpdate(FreshRSS_Entry $entry): FreshRSS_Entry {
+		try {
+			$entryDAO = FreshRSS_Factory::createEntryDao();
+			$existing = $entryDAO->searchByGuid($entry->feedId(), $entry->guid());
+		} catch (Throwable $e) {
+			Minz_Log::warning('AiAssistant: could not load existing entry on update: ' . $e->getMessage());
+			return $entry;
+		}
+		if ($existing === null) {
+			return $entry;
+		}
+		$old = $existing->attributes();
+		$new = $entry->attributes();
+		foreach (self::AI_KEYS as $key) {
+			if (array_key_exists($key, $old) && !array_key_exists($key, $new)) {
+				$entry->_attribute($key, $old[$key]);
+			}
+		}
+		$oldTopics = array_values(array_filter($existing->tags(), static fn(string $t) => str_starts_with($t, self::TOPIC_PREFIX)));
+		if ($oldTopics !== []) {
+			$entry->_tags(array_values(array_unique(array_merge($entry->tags(), $oldTopics))));
 		}
 		return $entry;
 	}
 
 	public function hookEntryBeforeDisplay(FreshRSS_Entry $entry): FreshRSS_Entry {
 		$attrs = $entry->attributes();
-		$entryId = $entry->id();
+		$entryId = htmlspecialchars((string) $entry->id(), ENT_QUOTES);
 
-		// Unscored: emit placeholder for JS batch scoring, but still show action buttons
 		if (!isset($attrs['ai_score'])) {
-			$placeholder = '<div class="ai-assistant-container ai-score-pending"'
-				. ' data-entry-id="' . htmlspecialchars($entryId) . '">'
+			// Not scored yet: the page script asks the service to score visible entries.
+			$html = '<div class="ai-assistant-container ai-score-pending" data-entry-id="' . $entryId . '">'
 				. '<span class="ai-scoring-status"></span>'
-				. '<button class="ai-summarize-btn">Summarize</button>'
+				. '<button class="ai-summarize-btn" data-force="1">Summarize</button>'
 				. '<button class="ai-chat-btn">Chat</button>'
 				. '</div>';
-			$entry->_content($placeholder . $entry->content());
+			$entry->_content($html . $entry->content());
 			$this->injectTranscriptSection($entry);
 			$this->injectFullContentSection($entry);
 			return $entry;
 		}
 
-		$score = intval($attrs['ai_score']);
-		$reason = htmlspecialchars($attrs['ai_score_reason'] ?? '', ENT_QUOTES);
-		$summary = $attrs['ai_summary'] ?? '';
-		$detail = $attrs['ai_detail'] ?? '';
-		$threshold = intval($this->getUserConfigurationValue('summary_threshold') ?: 5);
+		$score = (int) $attrs['ai_score'];
+		$reason = htmlspecialchars((string) ($attrs['ai_score_reason'] ?? ''), ENT_QUOTES);
+		$summary = (string) ($attrs['ai_summary'] ?? '');
+		$detail = (string) ($attrs['ai_detail'] ?? '');
+		$isFull = !empty($attrs['ai_summary_full']);
 
-		if ($score >= 7) {
-			$colorClass = 'ai-score-high';
-		} elseif ($score >= 4) {
-			$colorClass = 'ai-score-mid';
-		} else {
-			$colorClass = 'ai-score-low';
-		}
+		$colorClass = $score >= 7 ? 'ai-score-high' : ($score >= 4 ? 'ai-score-mid' : 'ai-score-low');
 
-		// Build badge
-		$html = '<div class="ai-assistant-container" data-entry-id="' . htmlspecialchars($entryId) . '">'
-			. '<span class="ai-score-badge ' . $colorClass . '" title="' . $reason . '">'
-			. $score . '</span>';
-
-		// Summary or summarize button
-		if ($summary) {
+		$html = '<div class="ai-assistant-container" data-entry-id="' . $entryId . '">'
+			. '<span class="ai-score-badge ' . $colorClass . '" title="' . $reason . '">' . $score . '</span>';
+		if ($summary !== '') {
 			$html .= '<span class="ai-summary">' . htmlspecialchars($summary) . '</span>';
-			// "More detail" button or cached detail
-			if ($detail) {
+		}
+		if ($score > 0) {
+			if ($summary === '' || !$isFull) {
+				$html .= '<button class="ai-summarize-btn" data-force="1" title="Write a full summary from the whole text">'
+					. ($summary === '' ? 'Summarize' : 'Full summary') . '</button>';
+			}
+			if ($detail !== '') {
 				$html .= '<button class="ai-detail-toggle">More detail</button>'
 					. '<div class="ai-detail" style="display:none;">' . $this->formatDetail($detail) . '</div>';
 			} else {
 				$html .= '<button class="ai-detail-btn">More detail</button>';
 			}
-		} else {
-			$html .= '<button class="ai-summarize-btn">Summarize</button>';
 		}
-
-		// Chat + Feedback buttons
 		$html .= '<button class="ai-chat-btn">Chat</button>'
 			. '<button class="ai-feedback-btn" data-dir="more" title="More like this">+</button>'
 			. '<button class="ai-feedback-btn" data-dir="less" title="Less like this">&minus;</button>'
 			. '</div>';
 
 		$entry->_content($html . $entry->content());
-
-		// Inject transcript section for YouTube videos
 		$this->injectTranscriptSection($entry);
 		$this->injectFullContentSection($entry);
 		return $entry;
 	}
 
-	/**
-	 * Append a collapsible transcript section to YouTube entries.
-	 */
-	private function injectTranscriptSection(FreshRSS_Entry $entry): void {
-		if (!$this->isYoutube($entry) || $this->isYoutubeShort($entry)) {
-			return;
-		}
-
-		$transcript = $entry->attributes()['yt_transcript'] ?? null;
-		$entryId = htmlspecialchars($entry->id());
-
-		if ($transcript) {
-			$escaped = htmlspecialchars($transcript);
-			$section = '<details class="ai-transcript-section">'
-				. '<summary>Video Transcript</summary>'
-				. '<div class="ai-transcript-content">' . nl2br($escaped) . '</div>'
-				. '</details>';
-			$entry->_content($entry->content() . $section);
-		} else {
-			$btn = '<button class="ai-load-transcript-btn" data-entry-id="' . $entryId . '">Load Transcript</button>';
-			$entry->_content($entry->content() . $btn);
-		}
-	}
-
-	/**
-	 * Append a collapsible full article section for feeds with fetch enabled.
-	 */
-	private function injectFullContentSection(FreshRSS_Entry $entry): void {
-		if ($this->isYoutube($entry) || !$this->shouldFetchFullContent($entry)) {
-			return;
-		}
-
-		$cached = $entry->attributes()['full_content'] ?? null;
-		$entryId = htmlspecialchars($entry->id());
-
-		if ($cached) {
-			$escaped = htmlspecialchars($cached);
-			$section = '<details class="ai-fullcontent-section">'
-				. '<summary>Full Article</summary>'
-				. '<div class="ai-fullcontent-content">' . nl2br($escaped) . '</div>'
-				. '</details>';
-			$entry->_content($entry->content() . $section);
-		} else {
-			$btn = '<button class="ai-load-fullcontent-btn" data-entry-id="' . $entryId . '">Load Full Article</button>';
-			$entry->_content($entry->content() . $btn);
-		}
-	}
-
-	// ── Config page + AJAX router ────────────────────────────────────────────
-
-	public function handleConfigureAction(): void {
-		$ajaxAction = Minz_Request::paramString('ajax_action');
-		if ($ajaxAction) {
-			$this->handleAjax($ajaxAction);
-			return;
-		}
-
-		// Load categories/feeds for the config template
-		$catDAO = FreshRSS_Factory::createCategoryDao();
-		$this->categories = $catDAO->listCategories(true, false) ?: [];
-
-		// Load current per-feed/category config
-		$this->summarizeFeeds = $this->loadAttribute('ext_ai_assistant_summarize_feeds');
-		$this->summarizeCategories = $this->loadAttribute('ext_ai_assistant_summarize_categories');
-		$this->scoreFeeds = $this->loadAttribute('ext_ai_assistant_score_feeds');
-		$this->scoreCategories = $this->loadAttribute('ext_ai_assistant_score_categories');
-		$this->fetchFeeds = $this->loadAttribute('ext_ai_assistant_fetch_feeds');
-		$this->fetchCategories = $this->loadAttribute('ext_ai_assistant_fetch_categories');
-
-		// Normal POST: save settings
-		if (Minz_Request::isPost()) {
-			$config = $this->getUserConfiguration() ?: [];
-			$config['api_key'] = Minz_Request::paramString('api_key');
-			$config['interest_profile'] = Minz_Request::paramString('interest_profile');
-			$config['summary_threshold'] = Minz_Request::paramString('summary_threshold');
-			$config['scoring_model'] = Minz_Request::paramString('scoring_model');
-			$config['summary_model'] = Minz_Request::paramString('summary_model');
-			$this->setUserConfiguration($config);
-
-			// Save per-feed/category checkboxes (score + summarize)
-			$sumFeedConfig = [];
-			$sumCatConfig = [];
-			$scoreFeedConfig = [];
-			$scoreCatConfig = [];
-			$fetchFeedConfig = [];
-			$fetchCatConfig = [];
-			foreach ($this->categories as $c) {
-				if (Minz_Request::paramBoolean('sum_cat_' . $c->id())) {
-					$sumCatConfig[$c->id()] = true;
-				}
-				if (Minz_Request::paramBoolean('score_cat_' . $c->id())) {
-					$scoreCatConfig[$c->id()] = true;
-				}
-				if (Minz_Request::paramBoolean('fetch_cat_' . $c->id())) {
-					$fetchCatConfig[$c->id()] = true;
-				}
-				foreach ($c->feeds() as $f) {
-					if (Minz_Request::paramBoolean('sum_feed_' . $f->id())) {
-						$sumFeedConfig[$f->id()] = true;
-					}
-					if (Minz_Request::paramBoolean('score_feed_' . $f->id())) {
-						$scoreFeedConfig[$f->id()] = true;
-					}
-					if (Minz_Request::paramBoolean('fetch_feed_' . $f->id())) {
-						$fetchFeedConfig[$f->id()] = true;
-					}
-				}
-			}
-			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_summarize_feeds', json_encode($sumFeedConfig));
-			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_summarize_categories', json_encode($sumCatConfig));
-			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_score_feeds', json_encode($scoreFeedConfig));
-			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_score_categories', json_encode($scoreCatConfig));
-			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_fetch_feeds', json_encode($fetchFeedConfig));
-			FreshRSS_Context::userConf()->_attribute('ext_ai_assistant_fetch_categories', json_encode($fetchCatConfig));
-			FreshRSS_Context::userConf()->save();
-
-			// Reload for display
-			$this->summarizeFeeds = $sumFeedConfig;
-			$this->summarizeCategories = $sumCatConfig;
-			$this->scoreFeeds = $scoreFeedConfig;
-			$this->scoreCategories = $scoreCatConfig;
-			$this->fetchFeeds = $fetchFeedConfig;
-			$this->fetchCategories = $fetchCatConfig;
-		}
-	}
-
-	/** @var FreshRSS_Category[] */
-	public array $categories = [];
-	public array $summarizeFeeds = [];
-	public array $summarizeCategories = [];
-	public array $scoreFeeds = [];
-	public array $scoreCategories = [];
-	public array $fetchFeeds = [];
-	public array $fetchCategories = [];
-
-	public function getSummarizeFeed(int $id): bool {
-		return isset($this->summarizeFeeds[$id]);
-	}
-
-	public function getSummarizeCategory(int $id): bool {
-		return isset($this->summarizeCategories[$id]);
-	}
-
-	public function getScoreFeed(int $id): bool {
-		return isset($this->scoreFeeds[$id]);
-	}
-
-	public function getScoreCategory(int $id): bool {
-		return isset($this->scoreCategories[$id]);
-	}
-
-	public function getFetchFeed(int $id): bool {
-		return isset($this->fetchFeeds[$id]);
-	}
-
-	public function getFetchCategory(int $id): bool {
-		return isset($this->fetchCategories[$id]);
-	}
-
-	private function loadAttribute(string $key): array {
-		$value = FreshRSS_Context::userConf()->attributeString($key);
-		if ($value === '') return [];
-		$decoded = json_decode($value, true);
-		return is_array($decoded) ? $decoded : [];
-	}
-
-	// ── YouTube helpers ──────────────────────────────────────────────────
-
-	private function extractYoutubeVideoId(string $url): ?string {
-		// youtube.com/watch?v=ID, youtu.be/ID, youtube.com/shorts/ID
-		if (preg_match('/(?:youtube\.com\/watch\?.*v=|youtu\.be\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/', $url, $m)) {
-			return $m[1];
-		}
-		return null;
-	}
-
-	private function fetchYoutubeInfo(string $videoId): ?array {
-		$url = 'http://youtube-helper:8000/video-info?v=' . urlencode($videoId);
-		$ch = curl_init($url);
-		curl_setopt_array($ch, [
-			CURLOPT_RETURNTRANSFER => true,
-			CURLOPT_CONNECTTIMEOUT => 2,
-			CURLOPT_TIMEOUT => 15,
-		]);
-		$response = curl_exec($ch);
-		$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-		curl_close($ch);
-
-		if ($httpCode !== 200 || !$response) {
-			Minz_Log::warning("AiAssistant: youtube-helper error (HTTP {$httpCode}) for {$videoId}");
-			return null;
-		}
-
-		$data = json_decode($response, true);
-		return is_array($data) ? $data : null;
-	}
-
-	/**
-	 * Get transcript for an entry, fetching from youtube-helper if not cached.
-	 * Returns the transcript text or null.
-	 */
-	private function getYoutubeTranscript(FreshRSS_Entry $entry, $entryDAO = null): ?string {
-		// Shorts have no useful transcript
-		if ($this->isYoutubeShort($entry)) {
-			return null;
-		}
-
-		$cached = $entry->attributes()['yt_transcript'] ?? null;
-		if ($cached !== null) {
-			return $cached ?: null;
-		}
-
-		$videoId = $this->extractYoutubeVideoId($entry->link());
-		if (!$videoId) return null;
-
-		$info = $this->fetchYoutubeInfo($videoId);
-		if (!$info) return null;
-
-		$transcript = $info['transcript'] ?? null;
-		$entry->_attribute('yt_duration', $info['duration']);
-		$entry->_attribute('yt_transcript', $transcript ?: '');
-		if ($entryDAO) {
-			$entryDAO->updateEntry($entry->toArray());
-		}
-
-		return $transcript;
-	}
-
-	private function shouldFetchFullContent(FreshRSS_Entry $entry): bool {
-		$feedId = $entry->feedId();
-		$feed = $entry->feed(false);
-		$catId = $feed ? ($feed->category() ? $feed->category()->id() : null) : null;
-
-		$feedConfig = $this->loadAttribute('ext_ai_assistant_fetch_feeds');
-		$catConfig = $this->loadAttribute('ext_ai_assistant_fetch_categories');
-
-		return isset($feedConfig[$feedId]) || ($catId !== null && isset($catConfig[$catId]));
-	}
-
-	/**
-	 * Fetch full article content from source URL using common selectors.
-	 */
-	private function fetchFullContent(FreshRSS_Entry $entry, $entryDAO = null): ?string {
-		// Check cache first (empty string = previous failure)
-		$cached = $entry->attributes()['full_content'] ?? null;
-		if ($cached !== null) {
-			return $cached ?: null;
-		}
-
-		$url = $entry->link();
-		if (!$url) {
-			$this->cacheFullContent($entry, '', $entryDAO);
-			return null;
-		}
-
-		$ch = curl_init($url);
-		curl_setopt_array($ch, [
-			CURLOPT_RETURNTRANSFER => true,
-			CURLOPT_FOLLOWLOCATION => true,
-			CURLOPT_TIMEOUT => 10,
-			CURLOPT_CONNECTTIMEOUT => 5,
-			CURLOPT_USERAGENT => 'FreshRSS/AiAssistant',
-		]);
-		$html = curl_exec($ch);
-		$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-		curl_close($ch);
-
-		if ($httpCode !== 200 || !$html) {
-			$this->cacheFullContent($entry, '', $entryDAO);
-			return null;
-		}
-
-		libxml_use_internal_errors(true);
-		$dom = new DOMDocument();
-		$dom->loadHTML('<?xml encoding="UTF-8">' . $html, LIBXML_NOERROR);
-		libxml_clear_errors();
-
-		$xpath = new DOMXPath($dom);
-		$selectors = [
-			'//article',
-			'//*[@role="main"]',
-			'//*[contains(@class,"post-content")]',
-			'//*[contains(@class,"article-body")]',
-			'//*[contains(@class,"entry-content")]',
-			'//*[contains(@class,"story-body")]',
-			'//main',
-		];
-
-		$content = null;
-		foreach ($selectors as $selector) {
-			$nodes = $xpath->query($selector);
-			if ($nodes && $nodes->length > 0) {
-				$content = $dom->saveHTML($nodes->item(0));
-				break;
-			}
-		}
-
-		if (!$content) {
-			$this->cacheFullContent($entry, '', $entryDAO);
-			return null;
-		}
-
-		$text = $this->htmlToText($content);
-		$this->cacheFullContent($entry, $text, $entryDAO);
-		return $text;
-	}
-
-	private function cacheFullContent(FreshRSS_Entry $entry, string $content, $entryDAO = null): void {
-		$entry->_attribute('full_content', $content);
-		if ($entryDAO) {
-			$entryDAO->updateEntry($entry->toArray());
-		}
-	}
-
-	/**
-	 * Convert HTML to clean plain text, handling table layouts, entities, etc.
-	 */
-	private function htmlToText(string $html): string {
-		// Remove AI assistant container injected by this extension
-		$html = preg_replace('/<div class="ai-assistant-container".*?<\/div>/s', '', $html);
-		// Remove script and style blocks
-		$html = preg_replace('/<script\b[^>]*>.*?<\/script>/si', '', $html);
-		$html = preg_replace('/<style\b[^>]*>.*?<\/style>/si', '', $html);
-		// Block elements → newlines
-		$html = preg_replace('/<\/(?:p|div|tr|h[1-6]|li|blockquote|figcaption)>/i', "\n", $html);
-		$html = preg_replace('/<br\s*\/?>/i', "\n", $html);
-		// Table cells → spaces
-		$html = preg_replace('/<\/(?:td|th)>/i', '  ', $html);
-		// Strip remaining tags
-		$html = strip_tags($html);
-		// Decode HTML entities
-		$html = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-		// Collapse multiple blank lines
-		$html = preg_replace('/\n{3,}/', "\n\n", $html);
-		// Collapse runs of spaces/tabs on a single line
-		$html = preg_replace('/[^\S\n]+/', ' ', $html);
-		return trim($html);
-	}
-
-	/**
-	 * Get the best available content for an entry (transcript for YouTube, stripped HTML otherwise).
-	 */
-	private function getEntryContent(FreshRSS_Entry $entry, int $maxChars, $entryDAO = null): string {
-		$videoId = $this->extractYoutubeVideoId($entry->link());
-		if ($videoId) {
-			$transcript = $this->getYoutubeTranscript($entry, $entryDAO);
-			if ($transcript) {
-				return mb_substr($transcript, 0, $maxChars);
-			}
-		}
-
-		$text = $this->htmlToText($entry->content());
-
-		// If content is sparse and full-content fetching is enabled, try fetching from source
-		if (mb_strlen($text) < 200 && $this->shouldFetchFullContent($entry)) {
-			$fullContent = $this->fetchFullContent($entry, $entryDAO);
-			if ($fullContent && mb_strlen($fullContent) > mb_strlen($text)) {
-				$text = $fullContent;
-			}
-		}
-
-		return mb_substr($text, 0, $maxChars);
-	}
-
-	/**
-	 * Check if an entry is a YouTube video.
-	 */
 	private function isYoutube(FreshRSS_Entry $entry): bool {
-		return $this->extractYoutubeVideoId($entry->link()) !== null;
+		return preg_match('#(?:youtube\.com/watch\?.*v=|youtu\.be/|youtube\.com/shorts/)[A-Za-z0-9_-]{11}#', $entry->link()) === 1;
 	}
 
-	/**
-	 * Check if an entry is a YouTube Short (cached attribute, then URL fallback).
-	 */
-	private function isYoutubeShort(FreshRSS_Entry $entry): bool {
-		$cached = $entry->attributes()['yt_is_short'] ?? null;
-		if ($cached !== null) {
-			return (bool) $cached;
-		}
-		return str_contains($entry->link(), 'youtube.com/shorts/');
-	}
-
-	private function shouldScore(FreshRSS_Entry $entry): bool {
-		$feedId = $entry->feedId();
-		$feed = $entry->feed(false);
-		$catId = $feed ? ($feed->category() ? $feed->category()->id() : null) : null;
-
-		$feedConfig = $this->loadAttribute('ext_ai_assistant_score_feeds');
-		$catConfig = $this->loadAttribute('ext_ai_assistant_score_categories');
-
-		return isset($feedConfig[$feedId]) || ($catId !== null && isset($catConfig[$catId]));
-	}
-
-	private function isAlwaysSummarize(FreshRSS_Entry $entry): bool {
-		$feedId = $entry->feedId();
-		$feed = $entry->feed(false);
-		$catId = $feed ? ($feed->category() ? $feed->category()->id() : null) : null;
-
-		$feedConfig = $this->loadAttribute('ext_ai_assistant_summarize_feeds');
-		$catConfig = $this->loadAttribute('ext_ai_assistant_summarize_categories');
-
-		return isset($feedConfig[$feedId]) || ($catId !== null && isset($catConfig[$catId]));
-	}
-
-	// ── AJAX handlers ────────────────────────────────────────────────────────
-
-	private function handleAjax(string $action): void {
-		// Streaming actions set their own headers; default to JSON for the rest
-		$streamingActions = ['summarize', 'detail', 'chat'];
-		if (!in_array($action, $streamingActions, true)) {
-			header('Content-Type: application/json');
-		}
-
-		switch ($action) {
-			case 'score_batch':
-				$this->ajaxScoreBatch();
-				break;
-			case 'summarize':
-				$this->ajaxSummarize();
-				break;
-			case 'detail':
-				$this->ajaxDetail();
-				break;
-			case 'feedback':
-				$this->ajaxFeedback();
-				break;
-			case 'chat':
-				$this->ajaxChat();
-				break;
-			case 'test_api_key':
-				$this->ajaxTestApiKey();
-				break;
-			case 'get_scored_entries':
-				$this->ajaxGetScoredEntries();
-				break;
-			case 'get_profile':
-				$this->ajaxGetProfile();
-				break;
-			case 'fetch_transcript':
-				$this->ajaxFetchTranscript();
-				break;
-			case 'score_pending':
-				$this->ajaxScorePending();
-				break;
-			case 'fetch_full_content':
-				$this->ajaxFetchFullContent();
-				break;
-			default:
-				echo json_encode(['status' => 'error', 'message' => 'Unknown action']);
-		}
-		exit;
-	}
-
-	private function ajaxScoreBatch(): void {
-		$entryIds = self::jsonParam('entry_ids');
-		if (!is_array($entryIds) || empty($entryIds)) {
-			echo json_encode(['status' => 'error', 'message' => 'No entry IDs']);
+	private function injectTranscriptSection(FreshRSS_Entry $entry): void {
+		if (!$this->isYoutube($entry)) {
 			return;
 		}
-
-		$apiKey = $this->getUserConfigurationValue('api_key');
-		if (!$apiKey) {
-			echo json_encode(['status' => 'error', 'message' => 'No API key configured']);
+		$attrs = $entry->attributes();
+		if (!empty($attrs['yt_is_short'])) {
 			return;
 		}
-
-		$entryDAO = FreshRSS_Factory::createEntryDao();
-		$entries = [];
-		foreach ($entryIds as $id) {
-			$entry = $entryDAO->searchById($id);
-			if ($entry) {
-				$entries[] = $entry;
-			}
-		}
-
-		$result = $this->scoreEntryBatch($entries, $entryDAO);
-		if ($result === null) {
-			echo json_encode(['status' => 'error', 'message' => 'Scoring failed']);
-			return;
-		}
-		echo json_encode(['status' => 'ok', 'scores' => $result]);
-	}
-
-	/**
-	 * Score a batch of entries. Returns array of score results, or null on failure.
-	 * Usable from both AJAX and CLI contexts.
-	 */
-	public function scoreEntryBatch(array $entries, $entryDAO): ?array {
-		$apiKey = $this->getUserConfigurationValue('api_key');
-		$profile = $this->getUserConfigurationValue('interest_profile');
-		$model = $this->getUserConfigurationValue('scoring_model') ?: 'claude-haiku-4-5-20251001';
-
-		if (!$apiKey) return null;
-
-		$entryMap = [];
-		$articlesForPrompt = [];
-		$shortResults = [];
-
-		foreach ($entries as $entry) {
-			$id = $entry->id();
-
-			if ($this->isYoutube($entry)) {
-				$videoId = $this->extractYoutubeVideoId($entry->link());
-				$info = $videoId ? $this->fetchYoutubeInfo($videoId) : null;
-
-				if ($info) {
-					$entry->_attribute('yt_is_short', !empty($info['is_short']));
-					$entry->_attribute('yt_duration', $info['duration']);
-				}
-
-				if ($this->isYoutubeShort($entry)) {
-					$entry->_attribute('ai_score', 0);
-					$entry->_attribute('ai_score_reason', 'YouTube Short (filtered)');
-					$entry->_attribute('ai_needs_scoring', null);
-					$entry->_isRead(true);
-					$entryDAO->updateEntry($entry->toArray());
-					$shortResults[] = ['id' => $id, 'score' => 0, 'reason' => 'YouTube Short (filtered)'];
-					continue;
-				}
-
-				$transcript = $this->getYoutubeTranscript($entry, $entryDAO);
-				$entryMap[$id] = $entry;
-				$articlesForPrompt[] = [
-					'id' => $id,
-					'title' => $entry->title(),
-					'source' => $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown',
-					'summary' => $transcript
-						? mb_substr($transcript, 0, 500)
-						: mb_substr($this->htmlToText($entry->content()), 0, 300),
-				];
-			} else {
-				$entryMap[$id] = $entry;
-				$articlesForPrompt[] = [
-					'id' => $id,
-					'title' => $entry->title(),
-					'source' => $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown',
-					'summary' => mb_substr($this->htmlToText($entry->content()), 0, 300),
-				];
-			}
-		}
-
-		if (empty($articlesForPrompt)) {
-			return $shortResults;
-		}
-
-		$prompt = "Score these articles/videos for relevance based on the interest profile below.\n\n"
-			. "<interest_profile>\n{$profile}\n</interest_profile>\n\n"
-			. "<articles>\n" . json_encode($articlesForPrompt, JSON_PRETTY_PRINT) . "\n</articles>\n\n"
-			. "For YouTube videos, the summary comes from the video's auto-generated transcript. "
-			. "Score based on actual content, not just the title.\n\n"
-			. "For each item, return a JSON array of objects with:\n"
-			. "- \"id\": the article id (string)\n"
-			. "- \"score\": 1-10 relevance score (10 = must read, 1 = irrelevant)\n"
-			. "- \"reason\": one sentence explaining the score\n\n"
-			. "Return ONLY the JSON array, no markdown fences, no other text.";
-
-		$response = $this->callClaude($apiKey, $model, $prompt, 2000);
-		if ($response === null) return null;
-
-		$scores = $this->parseJsonResponse($response);
-		if (!is_array($scores)) return null;
-
-		$results = [];
-		$threshold = intval($this->getUserConfigurationValue('summary_threshold') ?: 5);
-		$summaryModel = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-6';
-		$summaryEntries = [];
-
-		foreach ($scores as $s) {
-			$id = $s['id'] ?? null;
-			if ($id === null || !isset($entryMap[$id])) continue;
-
-			$entry = $entryMap[$id];
-			$score = intval($s['score'] ?? 5);
-			$reason = $s['reason'] ?? '';
-
-			$entry->_attribute('ai_score', $score);
-			$entry->_attribute('ai_score_reason', $reason);
-			$entry->_attribute('ai_needs_scoring', null);
-
-			$entryDAO->updateEntry($entry->toArray());
-
-			$results[] = [
-				'id' => $id,
-				'score' => $score,
-				'reason' => $reason,
-			];
-
-			if ($score >= $threshold || $this->isAlwaysSummarize($entry)) {
-				$summaryEntries[] = ['id' => $id, 'entry' => $entry, 'score' => $score];
-			}
-		}
-
-		if (!empty($summaryEntries)) {
-			$this->autoSummarize($apiKey, $summaryModel, $summaryEntries, $entryDAO, $results);
-		}
-
-		return array_merge($shortResults, $results);
-	}
-
-	// ── Summary generation (shared) ─────────────────────────────────────────
-
-	private function buildSummaryPrompt(FreshRSS_Entry $entry): string {
-		$profile = $this->getUserConfigurationValue('interest_profile');
-		$content = $this->getEntryContent($entry, 3000);
-		$title = $entry->title();
-		$source = $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown';
-		$isVideo = $this->isYoutube($entry);
-		$contentType = $isVideo ? 'YouTube video (from transcript)' : 'article';
-
-		return "You are a research assistant for a reader with these interests:\n\n"
-			. "<interest_profile>\n{$profile}\n</interest_profile>\n\n"
-			. "Summarize this {$contentType} — what it covers and what parts connect to the reader's interests.\n"
-			. "Focus on what the reader might find useful or interesting. Don't judge whether it is worth reading.\n"
-			. "Be direct. 1-3 sentences.\n\n"
-			. "Title: {$title}\nSource: {$source}\n\nContent:\n{$content}\n\n"
-			. "Return ONLY the summary, no quotes, no prefix.";
-	}
-
-	private function generateSummary(string $apiKey, string $model, FreshRSS_Entry $entry): ?string {
-		$prompt = $this->buildSummaryPrompt($entry);
-		$summary = $this->callClaude($apiKey, $model, $prompt, 300);
-		return $summary ? trim($summary) : null;
-	}
-
-	private function autoSummarize(
-		string $apiKey, string $model, array $summaryEntries,
-		$entryDAO, array &$results
-	): void {
-		foreach ($summaryEntries as $item) {
-			$entry = $item['entry'];
-			$summary = $this->generateSummary($apiKey, $model, $entry);
-			if ($summary) {
-				$entry->_attribute('ai_summary', $summary);
-				$entryDAO->updateEntry($entry->toArray());
-
-				foreach ($results as &$r) {
-					if ($r['id'] == $item['id']) {
-						$r['summary'] = $summary;
-						break;
-					}
-				}
-				unset($r);
-			}
+		$entryId = htmlspecialchars((string) $entry->id(), ENT_QUOTES);
+		$transcript = $attrs['yt_transcript'] ?? null;
+		if (is_string($transcript) && $transcript !== '') {
+			$section = '<details class="ai-transcript-section"><summary>Video transcript</summary>'
+				. '<div class="ai-transcript-content">' . nl2br(htmlspecialchars($transcript)) . '</div></details>';
+			$entry->_content($entry->content() . $section);
+		} elseif ($transcript === null) {
+			$entry->_content($entry->content() . '<button class="ai-load-transcript-btn" data-entry-id="' . $entryId . '">Load transcript</button>');
 		}
 	}
 
-	private function ajaxSummarize(): void {
-		$entryId = self::jsonParam('entry_id');
-		if (!$entryId) { $this->jsonError('No entry ID'); return; }
-
-		$apiKey = $this->getUserConfigurationValue('api_key');
-		$model = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-6';
-		if (!$apiKey) { $this->jsonError('No API key configured'); return; }
-
-		$entryDAO = FreshRSS_Factory::createEntryDao();
-		$entry = $entryDAO->searchById($entryId);
-		if (!$entry) { $this->jsonError('Entry not found'); return; }
-
-		$prompt = $this->buildSummaryPrompt($entry);
-
-		$this->beginSSE();
-		$summary = $this->streamClaudeMessages($apiKey, $model, '', [['role' => 'user', 'content' => $prompt]], 500);
-
-		if ($summary !== null) {
-			$summary = trim($summary);
-			$entry->_attribute('ai_summary', $summary);
-			$entryDAO->updateEntry($entry->toArray());
-		}
-	}
-
-	// ── Detail generation ───────────────────────────────────────────────────
-
-	private function ajaxDetail(): void {
-		$entryId = self::jsonParam('entry_id');
-		if (!$entryId) { $this->jsonError('No entry ID'); return; }
-
-		$apiKey = $this->getUserConfigurationValue('api_key');
-		$model = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-6';
-		if (!$apiKey) { $this->jsonError('No API key configured'); return; }
-
-		$entryDAO = FreshRSS_Factory::createEntryDao();
-		$entry = $entryDAO->searchById($entryId);
-		if (!$entry) { $this->jsonError('Entry not found'); return; }
-
-		// Return cached detail as JSON (no streaming needed)
-		$cached = $entry->attributes()['ai_detail'] ?? null;
-		if ($cached) {
-			header('Content-Type: application/json');
-			echo json_encode(['status' => 'ok', 'detail' => $cached]);
-			return;
-		}
-
-		$profile = $this->getUserConfigurationValue('interest_profile');
-		$content = $this->getEntryContent($entry, 6000, $entryDAO);
-		$title = $entry->title();
-		$source = $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown';
-		$isVideo = $this->isYoutube($entry);
-		$contentType = $isVideo ? 'YouTube video (from transcript)' : 'article';
-
-		$prompt = "Break down this {$contentType} for a reader with these interests:\n\n"
-			. "<interest_profile>\n{$profile}\n</interest_profile>\n\n"
-			. "Provide a structured breakdown in 3-6 sections. Each section gets a bold\n"
-			. "subtitle and 1-2 sentences of detail. Spend more time on sections relevant\n"
-			. "to the reader's interests. Don't skip sections, but be brief on less\n"
-			. "relevant parts.\n\n"
-			. "Title: {$title}\nSource: {$source}\n\nContent:\n{$content}\n\n"
-			. "Format: **Section Title** on its own line, then detail paragraph. No\n"
-			. "markdown headers or bullets.";
-
-		$this->beginSSE();
-		$detail = $this->streamClaudeMessages($apiKey, $model, '', [['role' => 'user', 'content' => $prompt]], 1500);
-
-		if ($detail !== null) {
-			$detail = trim($detail);
-			$entry->_attribute('ai_detail', $detail);
-			$entryDAO->updateEntry($entry->toArray());
+	private function injectFullContentSection(FreshRSS_Entry $entry): void {
+		$attrs = $entry->attributes();
+		$cached = $attrs['full_content'] ?? null;
+		if (is_string($cached) && $cached !== '') {
+			$section = '<details class="ai-fullcontent-section"><summary>Full article (fetched)</summary>'
+				. '<div class="ai-fullcontent-content">' . nl2br(htmlspecialchars($cached)) . '</div></details>';
+			$entry->_content($entry->content() . $section);
 		}
 	}
 
 	private function formatDetail(string $detail): string {
 		$escaped = htmlspecialchars($detail);
-		// Convert **Title** to <strong>Title</strong>
-		$formatted = preg_replace('/\*\*(.+?)\*\*/', '<strong>$1</strong>', $escaped);
-		// Convert newlines to <br>
+		$formatted = preg_replace('/\*\*(.+?)\*\*/', '<strong>$1</strong>', $escaped) ?? $escaped;
 		return nl2br($formatted);
 	}
 
-	// ── Feedback ─────────────────────────────────────────────────────────────
+	// ── Config page + AJAX router ────────────────────────────────────────────
 
-	private function ajaxFeedback(): void {
-		$entryId = self::jsonParam('entry_id');
-		$direction = self::jsonParam('direction');
-		$reason = self::jsonParam('reason');
-
-		if (!$entryId || !$direction) {
-			echo json_encode(['status' => 'error', 'message' => 'Missing parameters']);
+	#[\Override]
+	public function handleConfigureAction(): void {
+		$ajaxAction = Minz_Request::paramString('ajax_action');
+		if ($ajaxAction !== '') {
+			$this->handleAjax($ajaxAction);
 			return;
 		}
 
-		$apiKey = $this->getUserConfigurationValue('api_key');
-		$model = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-6';
-		$profile = $this->getUserConfigurationValue('interest_profile');
-
-		if (!$apiKey || !$profile) {
-			echo json_encode(['status' => 'error', 'message' => 'API key and profile required']);
-			return;
+		if (Minz_Request::isPost()) {
+			$config = $this->getUserConfiguration() ?: [];
+			$config['assistant_url'] = trim(Minz_Request::paramString('assistant_url', true));
+			$config['assistant_token'] = trim(Minz_Request::paramString('assistant_token', true));
+			$config['assistant_public_url'] = trim(Minz_Request::paramString('assistant_public_url', true));
+			// Legacy keys from v1 are no longer used
+			unset($config['api_key'], $config['interest_profile'], $config['summary_threshold'], $config['scoring_model'], $config['summary_model']);
+			$this->setUserConfiguration($config);
 		}
 
-		// Look up article title
-		$title = 'Unknown';
-		try {
-			$entryDAO = FreshRSS_Factory::createEntryDao();
-			$entry = $entryDAO->searchById($entryId);
-			if ($entry) {
-				$title = $entry->title();
-			}
-		} catch (Exception $e) {
-			// Use fallback title
-		}
-
-		$label = $direction === 'more' ? 'MORE' : 'LESS';
-		$prompt = "Here is the user's interest profile:\n\n"
-			. "<profile>\n{$profile}\n</profile>\n\n"
-			. "They said they want {$label} of articles like \"{$title}\""
-			. ($reason ? " because \"{$reason}\"" : "") . ".\n\n"
-			. "Update the interest profile to reflect this. If a similar interest already exists, "
-			. "adjust its intensity or wording. If it's new, add it in the appropriate section. "
-			. "Return the complete updated profile text, nothing else.";
-
-		$newProfile = $this->callClaude($apiKey, $model, $prompt, 2000);
-		if ($newProfile === null) {
-			echo json_encode(['status' => 'error', 'message' => 'Profile rewrite failed']);
-			return;
-		}
-
-		$newProfile = trim($newProfile);
-		$config = $this->getUserConfiguration() ?: [];
-		$config['interest_profile'] = $newProfile;
-		$this->setUserConfiguration($config);
-
-		echo json_encode(['status' => 'ok', 'profile_changed' => true]);
+		$this->serviceUrl = $this->serviceUrl();
+		$this->publicUrl = $this->publicUrl();
+		$this->tokenFromEnv = (string) getenv('ASSISTANT_INTERNAL_TOKEN') !== '' && (string) ($this->getUserConfigurationValue('assistant_token') ?? '') === '';
+		$this->tokenConfigured = $this->serviceToken() !== '';
 	}
 
-	private function ajaxTestApiKey(): void {
-		$apiKey = self::jsonParam('api_key');
-		if (!$apiKey) {
-			$apiKey = $this->getUserConfigurationValue('api_key');
-		}
-
-		if (!$apiKey) {
-			echo json_encode(['status' => 'error', 'message' => 'No API key provided']);
-			return;
-		}
-
-		$response = $this->callClaude($apiKey, 'claude-haiku-4-5-20251001', 'Say "ok"', 10);
-		if ($response !== null) {
-			echo json_encode(['status' => 'ok', 'message' => 'API key is valid']);
-		} else {
-			echo json_encode(['status' => 'error', 'message' => 'API call failed — check your key']);
-		}
-	}
-
-	private function ajaxGetScoredEntries(): void {
-		$sinceHours = intval(self::jsonParam('since') ?: 24);
-		$since = time() - ($sinceHours * 3600);
-
-		$entryDAO = FreshRSS_Factory::createEntryDao();
-
-		// Use FreshRSS search to get recent entries
-		$search = new FreshRSS_BooleanSearch('');
-		$entries = $entryDAO->listWhere('A', $search, FreshRSS_Entry::STATE_ALL, 'DESC', 500);
-
-		$results = [];
-		foreach ($entries as $entry) {
-			if ($entry->date(true) < $since) continue;
-
-			$attrs = $entry->attributes();
-			if (!isset($attrs['ai_score'])) continue;
-
-			$results[] = [
-				'id' => $entry->id(),
-				'title' => $entry->title(),
-				'score' => intval($attrs['ai_score']),
-				'reason' => $attrs['ai_score_reason'] ?? '',
-				'summary' => $attrs['ai_summary'] ?? '',
-				'url' => $entry->link(),
-				'date' => date('c', $entry->date(true)),
-				'source' => $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown',
-			];
-		}
-
-		echo json_encode(['status' => 'ok', 'entries' => $results]);
-	}
-
-	private function ajaxGetProfile(): void {
-		$profile = $this->getUserConfigurationValue('interest_profile') ?: '';
-		echo json_encode(['status' => 'ok', 'profile' => $profile]);
-	}
-
-	private function ajaxFetchTranscript(): void {
-		$entryId = self::jsonParam('entry_id');
-		if (!$entryId) {
-			echo json_encode(['status' => 'error', 'message' => 'No entry ID']);
-			return;
-		}
-
-		$entryDAO = FreshRSS_Factory::createEntryDao();
-		$entry = $entryDAO->searchById($entryId);
-		if (!$entry) {
-			echo json_encode(['status' => 'error', 'message' => 'Entry not found']);
-			return;
-		}
-
-		$transcript = $this->getYoutubeTranscript($entry, $entryDAO);
-		if ($transcript) {
-			echo json_encode(['status' => 'ok', 'transcript' => $transcript]);
-		} else {
-			echo json_encode(['status' => 'error', 'message' => 'Transcript unavailable']);
-		}
-	}
-
-	private function ajaxFetchFullContent(): void {
-		$entryId = self::jsonParam('entry_id');
-		if (!$entryId) {
-			echo json_encode(['status' => 'error', 'message' => 'No entry ID']);
-			return;
-		}
-
-		$entryDAO = FreshRSS_Factory::createEntryDao();
-		$entry = $entryDAO->searchById($entryId);
-		if (!$entry) {
-			echo json_encode(['status' => 'error', 'message' => 'Entry not found']);
-			return;
-		}
-
-		$content = $this->fetchFullContent($entry, $entryDAO);
-		if ($content) {
-			echo json_encode(['status' => 'ok', 'content' => $content]);
-		} else {
-			echo json_encode(['status' => 'error', 'message' => 'Could not fetch full content']);
-		}
-	}
-
-	/**
-	 * Find and score all entries with ai_needs_scoring=true.
-	 * Called via AJAX (score_pending action) or from CLI.
-	 */
-	private function ajaxScorePending(): void {
-		$result = $this->scorePendingEntries();
-		echo json_encode($result);
-	}
-
-	/**
-	 * Score all pending entries. Returns status array.
-	 */
-	public function scorePendingEntries(): array {
-		$apiKey = $this->getUserConfigurationValue('api_key');
-		if (!$apiKey) {
-			return ['status' => 'error', 'message' => 'No API key configured'];
-		}
-
-		$entryDAO = FreshRSS_Factory::createEntryDao();
-		$search = new FreshRSS_BooleanSearch('');
-		$allEntries = $entryDAO->listWhere('A', $search, FreshRSS_Entry::STATE_ALL, 'DESC', 200);
-
-		$pending = [];
-		foreach ($allEntries as $entry) {
-			$attrs = $entry->attributes();
-			if (!empty($attrs['ai_needs_scoring']) && !isset($attrs['ai_score'])) {
-				$pending[] = $entry;
-			}
-		}
-
-		if (empty($pending)) {
-			return ['status' => 'ok', 'scored' => 0, 'message' => 'No pending entries'];
-		}
-
-		$totalScored = 0;
-		$allResults = [];
-		$chunks = array_chunk($pending, 10);
-
-		foreach ($chunks as $chunk) {
-			$result = $this->scoreEntryBatch($chunk, $entryDAO);
-			if ($result !== null) {
-				$totalScored += count($result);
-				$allResults = array_merge($allResults, $result);
-			}
-		}
-
-		return ['status' => 'ok', 'scored' => $totalScored, 'results' => $allResults];
-	}
-
-	// ── Chat ────────────────────────────────────────────────────────────────
-
-	private function ajaxChat(): void {
-		$entryId = self::jsonParam('entry_id');
-		$message = self::jsonParam('message');
-		$model = self::jsonParam('model');
-
-		if (!$entryId || !$message) { $this->jsonError('Missing entry_id or message'); return; }
-
-		$apiKey = $this->getUserConfigurationValue('api_key');
-		if (!$model) {
-			$model = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-6';
-		}
-		if (!$apiKey) { $this->jsonError('No API key configured'); return; }
-
-		$entryDAO = FreshRSS_Factory::createEntryDao();
-		$entry = $entryDAO->searchById($entryId);
-		if (!$entry) { $this->jsonError('Entry not found'); return; }
-
-		$profile = $this->getUserConfigurationValue('interest_profile');
-		$content = $this->getEntryContent($entry, 6000, $entryDAO);
-		$title = $entry->title();
-		$source = $entry->feed(false) ? $entry->feed(false)->name() : 'Unknown';
-		$summary = $entry->attributes()['ai_summary'] ?? '';
-		$detail = $entry->attributes()['ai_detail'] ?? '';
-		$isVideo = $this->isYoutube($entry);
-		$contentType = $isVideo ? 'YouTube video' : 'article';
-		$contentTag = $isVideo ? 'video_transcript' : 'article_content';
-
-		$system = "You are a research assistant helping a reader understand a {$contentType}.\n\n"
-			. "{$contentType}: {$title}\nSource: {$source}\n\n"
-			. "<{$contentTag}>\n{$content}\n</{$contentTag}>";
-
-		if ($profile) {
-			$system .= "\n\n<reader_interests>\n{$profile}\n</reader_interests>";
-		}
-		if ($summary) {
-			$system .= "\n\nPrevious summary: {$summary}";
-		}
-		if ($detail) {
-			$system .= "\n\nPrevious detail breakdown:\n{$detail}";
-		}
-
-		$system .= "\n\nAnswer questions about this {$contentType}. Start with what the content says. "
-			. "If the content doesn't fully answer the question, supplement with your own knowledge "
-			. "or search the web — but clearly note when you're going beyond the source material. "
-			. "Be concise and direct.";
-
-		$chatHistory = $entry->attributes()['ai_chat'] ?? [];
-		if (!is_array($chatHistory)) {
-			$chatHistory = [];
-		}
-
-		$messages = [];
-		foreach ($chatHistory as $turn) {
-			$messages[] = ['role' => $turn['role'], 'content' => $turn['content']];
-		}
-		$messages[] = ['role' => 'user', 'content' => $message];
-
-		$this->beginSSE();
-		$response = $this->streamClaudeMessages($apiKey, $model, $system, $messages, 1500, true);
-
-		if ($response !== null) {
-			$response = trim($response);
-			$chatHistory[] = ['role' => 'user', 'content' => $message];
-			$chatHistory[] = ['role' => 'assistant', 'content' => $response];
-			$entry->_attribute('ai_chat', $chatHistory);
-			$entryDAO->updateEntry($entry->toArray());
-		}
-	}
-
-	// ── Claude API ───────────────────────────────────────────────────────────
-
-	private function callClaudeMessages(string $apiKey, string $model, string $system, array $messages, int $maxTokens, bool $webSearch = false): ?string {
-		$body = [
-			'model' => $model,
-			'max_tokens' => $maxTokens,
-			'messages' => $messages,
-		];
-		if ($system !== '') {
-			$body['system'] = $system;
-		}
-		if ($webSearch) {
-			$body['tools'] = [
-				['type' => 'web_search_20250305', 'name' => 'web_search', 'max_uses' => 3],
-			];
-		}
-
-		$ch = curl_init('https://api.anthropic.com/v1/messages');
-		curl_setopt_array($ch, [
-			CURLOPT_POST => true,
-			CURLOPT_HTTPHEADER => [
-				'Content-Type: application/json',
-				'x-api-key: ' . $apiKey,
-				'anthropic-version: 2023-06-01',
-			],
-			CURLOPT_POSTFIELDS => json_encode($body),
-			CURLOPT_RETURNTRANSFER => true,
-			CURLOPT_TIMEOUT => 90,
-		]);
-
-		$response = curl_exec($ch);
-		$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-		curl_close($ch);
-
-		if ($httpCode !== 200 || !$response) {
-			Minz_Log::error("AiAssistant: Claude API error (HTTP {$httpCode}): " . ($response ?: 'no response'));
-			return null;
-		}
-
-		$data = json_decode($response, true);
-
-		// With tools, response has multiple content blocks — extract all text
-		$text = '';
-		foreach ($data['content'] ?? [] as $block) {
-			if (($block['type'] ?? '') === 'text') {
-				$text .= $block['text'];
-			}
-		}
-		return $text ?: null;
-	}
-
-	private function callClaude(string $apiKey, string $model, string $prompt, int $maxTokens): ?string {
-		return $this->callClaudeMessages($apiKey, $model, '', [['role' => 'user', 'content' => $prompt]], $maxTokens);
-	}
-
-	// ── Streaming Claude API ────────────────────────────────────────────────
-
-	private function beginSSE(): void {
-		header('Content-Type: text/event-stream');
-		header('Cache-Control: no-cache');
-		header('Connection: keep-alive');
-		header('X-Accel-Buffering: no');
-		while (ob_get_level()) ob_end_flush();
-		flush();
-	}
-
-	private function sendSSE(string $type, string $data = ''): void {
-		echo "data: " . json_encode([$type => $data ?: true]) . "\n\n";
-		flush();
-	}
-
-	private function streamClaudeMessages(
-		string $apiKey, string $model, string $system,
-		array $messages, int $maxTokens, bool $webSearch = false
-	): ?string {
-		$body = [
-			'model' => $model,
-			'max_tokens' => $maxTokens,
-			'stream' => true,
-			'messages' => $messages,
-		];
-		if ($system !== '') {
-			$body['system'] = $system;
-		}
-		if ($webSearch) {
-			$body['tools'] = [
-				['type' => 'web_search_20250305', 'name' => 'web_search', 'max_uses' => 3],
-			];
-		}
-
-		$fullText = '';
-		$buffer = '';
-
-		$ch = curl_init('https://api.anthropic.com/v1/messages');
-		curl_setopt_array($ch, [
-			CURLOPT_POST => true,
-			CURLOPT_HTTPHEADER => [
-				'Content-Type: application/json',
-				'x-api-key: ' . $apiKey,
-				'anthropic-version: 2023-06-01',
-			],
-			CURLOPT_POSTFIELDS => json_encode($body),
-			CURLOPT_RETURNTRANSFER => false,
-			CURLOPT_TIMEOUT => 120,
-			CURLOPT_WRITEFUNCTION => function ($ch, $data) use (&$fullText, &$buffer) {
-				$buffer .= $data;
-				while (($pos = strpos($buffer, "\n\n")) !== false) {
-					$frame = substr($buffer, 0, $pos);
-					$buffer = substr($buffer, $pos + 2);
-
-					foreach (explode("\n", $frame) as $line) {
-						if (!str_starts_with($line, 'data: ')) continue;
-						$json = json_decode(substr($line, 6), true);
-						if (!$json) continue;
-
-						$type = $json['type'] ?? '';
-						if ($type === 'content_block_delta') {
-							$delta = $json['delta'] ?? [];
-							if (($delta['type'] ?? '') === 'text_delta') {
-								$text = $delta['text'];
-								$fullText .= $text;
-								echo "data: " . json_encode(['text' => $text]) . "\n\n";
-								flush();
-							}
-						} elseif ($type === 'error') {
-							$msg = $json['error']['message'] ?? 'API error';
-							echo "data: " . json_encode(['error' => $msg]) . "\n\n";
-							flush();
-						}
-					}
+	private function handleAjax(string $action): void {
+		switch ($action) {
+			case 'score_batch':
+				$ids = self::jsonParam('entry_ids');
+				if (!is_array($ids) || $ids === []) {
+					$this->jsonOut(['status' => 'error', 'message' => 'No entry IDs']);
+					break;
 				}
-				return strlen($data);
-			},
-		]);
+				[$code, $data] = $this->serviceJson('POST', '/internal/score', ['entry_ids' => array_map('strval', $ids)], 300);
+				if ($code !== 200 || $data === null) {
+					$this->jsonOut(['status' => 'error', 'message' => $data['detail'] ?? "service error (HTTP {$code})"]);
+					break;
+				}
+				$this->jsonOut($data);
+				break;
 
-		$success = curl_exec($ch);
-		$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-		curl_close($ch);
+			case 'summarize':
+				$this->serviceStream('/internal/entries/' . rawurlencode((string) self::jsonParam('entry_id')) . '/summarize',
+					['force' => (bool) self::jsonParam('force')]);
+				break;
 
-		if (!$success || $httpCode !== 200) {
-			echo "data: " . json_encode(['error' => "API error (HTTP {$httpCode})"]) . "\n\n";
-			flush();
-			return null;
+			case 'detail':
+				$this->serviceStream('/internal/entries/' . rawurlencode((string) self::jsonParam('entry_id')) . '/detail',
+					['force' => (bool) self::jsonParam('force')]);
+				break;
+
+			case 'chat':
+				$this->serviceStream('/internal/entries/' . rawurlencode((string) self::jsonParam('entry_id')) . '/chat', [
+					'message' => (string) self::jsonParam('message'),
+					'model' => (string) self::jsonParam('model') ?: null,
+				]);
+				break;
+
+			case 'chat_history':
+				[$code, $data] = $this->serviceJson('GET', '/internal/entries/' . rawurlencode((string) self::jsonParam('entry_id')) . '/chat');
+				$this->jsonOut($code === 200 && $data !== null ? $data + ['status' => 'ok'] : ['status' => 'error', 'messages' => []]);
+				break;
+
+			case 'feedback':
+				[$code, $data] = $this->serviceJson('POST', '/internal/feedback', [
+					'entry_id' => (string) self::jsonParam('entry_id'),
+					'direction' => (string) self::jsonParam('direction'),
+					'reason' => (string) self::jsonParam('reason'),
+				], 180);
+				$this->jsonOut($code === 200 && $data !== null ? $data : ['status' => 'error', 'message' => $data['detail'] ?? "service error (HTTP {$code})"]);
+				break;
+
+			case 'fetch_transcript':
+				[$code, $data] = $this->serviceJson('POST', '/internal/entries/' . rawurlencode((string) self::jsonParam('entry_id')) . '/transcript', [], 90);
+				$this->jsonOut($code === 200 && $data !== null ? $data : ['status' => 'error', 'message' => $data['detail'] ?? "service error (HTTP {$code})"]);
+				break;
+
+			case 'fetch_full_content':
+				[$code, $data] = $this->serviceJson('POST', '/internal/entries/' . rawurlencode((string) self::jsonParam('entry_id')) . '/full_content', [], 60);
+				$this->jsonOut($code === 200 && $data !== null ? $data : ['status' => 'error', 'message' => $data['detail'] ?? "service error (HTTP {$code})"]);
+				break;
+
+			case 'test_service':
+				[$code, $data] = $this->serviceJson('GET', '/internal/health', null, 15);
+				if ($code === 200 && $data !== null) {
+					$this->jsonOut(['status' => 'ok', 'message' => 'Connected. ' . (int) ($data['pending'] ?? 0) . ' entries pending scoring.']);
+				} else {
+					$this->jsonOut(['status' => 'error', 'message' => $data['detail'] ?? "Cannot reach the assistant service (HTTP {$code})"]);
+				}
+				break;
+
+			default:
+				$this->jsonOut(['status' => 'error', 'message' => 'Unknown action'], 400);
 		}
-
-		echo "data: " . json_encode(['done' => true]) . "\n\n";
-		flush();
-
-		return $fullText ?: null;
-	}
-
-	private function jsonError(string $message): void {
-		header('Content-Type: application/json');
-		echo json_encode(['status' => 'error', 'message' => $message]);
-	}
-
-	private function parseJsonResponse(string $text): ?array {
-		$text = trim($text);
-		// Strip markdown fences if present
-		if (str_starts_with($text, '```')) {
-			$text = substr($text, strpos($text, "\n") + 1);
-			if (str_ends_with($text, '```')) {
-				$text = substr($text, 0, -3);
-			}
-			$text = trim($text);
-		}
-		$result = json_decode($text, true);
-		return is_array($result) ? $result : null;
+		exit;
 	}
 }

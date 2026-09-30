@@ -1,190 +1,70 @@
 <?php
 /** @var AiAssistantExtension $this */
-$apiKey = $this->getUserConfigurationValue('api_key') ?? '';
-$profile = $this->getUserConfigurationValue('interest_profile') ?? '';
-$threshold = $this->getUserConfigurationValue('summary_threshold') ?: '5';
-$scoringModel = $this->getUserConfigurationValue('scoring_model') ?: 'claude-haiku-4-5-20251001';
-$summaryModel = $this->getUserConfigurationValue('summary_model') ?: 'claude-sonnet-4-6';
+$assistantUrl = (string) ($this->getUserConfigurationValue('assistant_url') ?? '');
+$assistantToken = (string) ($this->getUserConfigurationValue('assistant_token') ?? '');
+$assistantPublicUrl = (string) ($this->getUserConfigurationValue('assistant_public_url') ?? '');
 $formAction = _url('extension', 'configure', 'e', $this->getName());
 $csrfToken = FreshRSS_Auth::csrfToken();
 ?>
 
 <div class="panel panel-default">
 	<div class="panel-heading">
-		<h3>AI Assistant Settings</h3>
+		<h3>AI Assistant</h3>
 	</div>
 	<div class="panel-body">
+		<p class="help-block">
+			Scoring, summaries, briefs and chat run in the <strong>assistant</strong> service. Interest profile,
+			models and per-feed rules are configured there.
+			<?php if ($this->publicUrl !== '') { ?>
+				<a class="btn btn-primary" href="<?= htmlspecialchars($this->publicUrl) ?>" target="_blank" rel="noopener">Open the assistant</a>
+			<?php } ?>
+		</p>
+		<p>
+			<button type="button" id="ai-test-service" class="btn btn-default">Test connection</button>
+			<span id="ai-test-result" style="margin-left: 8px;"></span>
+		</p>
+
 		<form method="post" action="<?= $formAction ?>">
 			<input type="hidden" name="_csrf" value="<?= htmlspecialchars($csrfToken) ?>">
 
 			<div class="form-group">
-				<label for="api_key">Anthropic API Key</label>
-				<div style="display: flex; gap: 8px; align-items: start;">
-					<input type="password" id="api_key" name="api_key"
-						class="form-control" style="flex: 1;"
-						value="<?= htmlspecialchars($apiKey) ?>"
-						placeholder="sk-ant-...">
-					<button type="button" id="test-api-key" class="btn btn-default">Test</button>
-				</div>
-				<span id="api-key-result" style="margin-top: 4px; display: inline-block;"></span>
+				<label for="assistant_url">Service URL (internal)</label>
+				<p class="help-block">Currently using <code><?= htmlspecialchars($this->serviceUrl) ?></code>. Leave empty to use the <code>ASSISTANT_URL</code> environment variable.</p>
+				<input type="text" id="assistant_url" name="assistant_url" class="form-control" value="<?= htmlspecialchars($assistantUrl) ?>" placeholder="http://assistant:8000">
 			</div>
 
 			<div class="form-group">
-				<label for="summary_threshold">Auto-Summary Threshold</label>
+				<label for="assistant_token">Internal token</label>
 				<p class="help-block">
-					Articles scoring at or above this value are auto-summarized after scoring.
+					<?php if ($this->tokenFromEnv) { ?>Set from the <code>ASSISTANT_INTERNAL_TOKEN</code> environment variable. Leave empty unless you need to override it.<?php }
+					elseif (!$this->tokenConfigured) { ?><strong>Not configured.</strong> Set <code>ASSISTANT_INTERNAL_TOKEN</code> in the deploy <code>.env</code> (same value for both containers) or paste it here.<?php }
+					else { ?>Configured here (overrides the environment variable).<?php } ?>
 				</p>
-				<input type="number" id="summary_threshold" name="summary_threshold"
-					class="form-control" style="width: 80px;"
-					min="1" max="10" value="<?= htmlspecialchars($threshold) ?>">
+				<input type="password" id="assistant_token" name="assistant_token" class="form-control" value="<?= htmlspecialchars($assistantToken) ?>" autocomplete="off">
 			</div>
 
 			<div class="form-group">
-				<label for="scoring_model">Scoring Model</label>
-				<select id="scoring_model" name="scoring_model" class="form-control" style="width: auto;">
-					<option value="claude-haiku-4-5-20251001" <?= $scoringModel === 'claude-haiku-4-5-20251001' ? 'selected' : '' ?>>Claude Haiku 4.5</option>
-					<option value="claude-sonnet-4-6" <?= $scoringModel === 'claude-sonnet-4-6' ? 'selected' : '' ?>>Claude Sonnet 4.6</option>
-				</select>
+				<label for="assistant_public_url">Assistant UI URL (for the "Open the assistant" link)</label>
+				<input type="text" id="assistant_public_url" name="assistant_public_url" class="form-control" value="<?= htmlspecialchars($assistantPublicUrl) ?>" placeholder="http://freshrss.yuffie.ts.net:8081">
 			</div>
 
-			<div class="form-group">
-				<label for="summary_model">Summary / Profile Model</label>
-				<select id="summary_model" name="summary_model" class="form-control" style="width: auto;">
-					<option value="claude-sonnet-4-6" <?= $summaryModel === 'claude-sonnet-4-6' ? 'selected' : '' ?>>Claude Sonnet 4.6</option>
-					<option value="claude-haiku-4-5-20251001" <?= $summaryModel === 'claude-haiku-4-5-20251001' ? 'selected' : '' ?>>Claude Haiku 4.5</option>
-				</select>
-			</div>
-
-			<div class="form-group">
-				<label>Per-Feed Settings</label>
-				<p class="help-block">
-					<strong>Score</strong> — checked feeds get AI-scored. Unchecked feeds skip all scoring logic.<br>
-					<strong>Summarize</strong> — checked feeds always get summarized, regardless of score.<br>
-					<strong>Fetch</strong> — fetch full article content from source URL when RSS content is sparse.
-				</p>
-				<?php foreach ($this->categories as $c) { ?>
-				<table class="table table-condensed" style="margin-bottom: 4px;">
-					<thead>
-						<tr>
-							<th style="width: 40px; height: 60px; vertical-align: bottom; position: relative;">
-								<span style="display: inline-block; transform: rotate(-45deg); transform-origin: bottom left; white-space: nowrap; position: absolute; bottom: 6px; left: 20px; font-size: 12px;">Score</span>
-							</th>
-							<th style="width: 40px; height: 60px; vertical-align: bottom; position: relative;">
-								<span style="display: inline-block; transform: rotate(-45deg); transform-origin: bottom left; white-space: nowrap; position: absolute; bottom: 6px; left: 20px; font-size: 12px;">Summarize</span>
-							</th>
-							<th style="width: 40px; height: 60px; vertical-align: bottom; position: relative;">
-								<span style="display: inline-block; transform: rotate(-45deg); transform-origin: bottom left; white-space: nowrap; position: absolute; bottom: 6px; left: 20px; font-size: 12px;">Fetch</span>
-							</th>
-							<th></th>
-						</tr>
-					</thead>
-					<tbody>
-						<tr>
-							<td style="text-align: center;">
-								<input type="checkbox"
-									id="score_cat_<?= $c->id() ?>"
-									name="score_cat_<?= $c->id() ?>"
-									value="1"
-									<?= $this->getScoreCategory($c->id()) ? 'checked' : '' ?>>
-							</td>
-							<td style="text-align: center;">
-								<input type="checkbox"
-									id="sum_cat_<?= $c->id() ?>"
-									name="sum_cat_<?= $c->id() ?>"
-									value="1"
-									<?= $this->getSummarizeCategory($c->id()) ? 'checked' : '' ?>>
-							</td>
-							<td style="text-align: center;">
-								<input type="checkbox"
-									id="fetch_cat_<?= $c->id() ?>"
-									name="fetch_cat_<?= $c->id() ?>"
-									value="1"
-									<?= $this->getFetchCategory($c->id()) ? 'checked' : '' ?>>
-							</td>
-							<td><strong><label for="score_cat_<?= $c->id() ?>"><?= htmlspecialchars($c->name()) ?></label></strong></td>
-						</tr>
-						<?php foreach ($c->feeds() as $f) { ?>
-							<tr>
-								<td style="text-align: center; padding-left: 10px;">
-									<input type="checkbox"
-										id="score_feed_<?= $f->id() ?>"
-										name="score_feed_<?= $f->id() ?>"
-										value="1"
-										<?= $this->getScoreFeed($f->id()) ? 'checked' : '' ?>>
-								</td>
-								<td style="text-align: center; padding-left: 10px;">
-									<input type="checkbox"
-										id="sum_feed_<?= $f->id() ?>"
-										name="sum_feed_<?= $f->id() ?>"
-										value="1"
-										<?= $this->getSummarizeFeed($f->id()) ? 'checked' : '' ?>>
-								</td>
-								<td style="text-align: center; padding-left: 10px;">
-									<input type="checkbox"
-										id="fetch_feed_<?= $f->id() ?>"
-										name="fetch_feed_<?= $f->id() ?>"
-										value="1"
-										<?= $this->getFetchFeed($f->id()) ? 'checked' : '' ?>>
-								</td>
-								<td style="padding-left: 20px;"><label for="score_feed_<?= $f->id() ?>"><?= htmlspecialchars($f->name()) ?></label></td>
-							</tr>
-						<?php } ?>
-					</tbody>
-				</table>
-				<?php } ?>
-			</div>
-
-			<div class="form-group">
-				<label for="interest_profile">Interest Profile</label>
-				<p class="help-block">
-					This text is sent as context for scoring and feedback. Edit directly or let it evolve via +/&minus; feedback on articles.
-				</p>
-				<textarea id="interest_profile" name="interest_profile"
-					class="form-control" rows="20"
-					style="font-family: monospace; tab-size: 4; width: 100%; box-sizing: border-box;"
-				><?= htmlspecialchars($profile) ?></textarea>
-			</div>
-
-			<button type="submit" class="btn btn-primary">Save Settings</button>
+			<button type="submit" class="btn btn-primary">Save</button>
 		</form>
 	</div>
 </div>
 
 <script>
-document.getElementById('test-api-key').addEventListener('click', function() {
-	var btn = this;
-	var result = document.getElementById('api-key-result');
-	var apiKey = document.getElementById('api_key').value;
-	btn.disabled = true;
-	result.textContent = 'Testing...';
-	result.style.color = '';
-
+document.getElementById('ai-test-service').addEventListener('click', function () {
+	var btn = this, out = document.getElementById('ai-test-result');
+	btn.disabled = true; out.textContent = 'Testing…'; out.style.color = '';
 	var url = new URL(window.location.pathname, window.location.origin);
-	url.searchParams.set('c', 'extension');
-	url.searchParams.set('a', 'configure');
-	url.searchParams.set('e', 'AI Assistant');
-	url.searchParams.set('ajax_action', 'test_api_key');
-
-	fetch(url.toString(), {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json; charset=UTF-8' },
-		body: JSON.stringify({
-			api_key: apiKey,
-			ajax: true,
-			_csrf: context.csrf
-		})
-	})
-	.then(function(r) { return r.json(); })
-	.then(function(data) {
-		result.textContent = data.message;
-		result.style.color = data.status === 'ok' ? '#22c55e' : '#ef4444';
-	})
-	.catch(function() {
-		result.textContent = 'Request failed';
-		result.style.color = '#ef4444';
-	})
-	.finally(function() {
-		btn.disabled = false;
-	});
+	url.searchParams.set('c', 'extension'); url.searchParams.set('a', 'configure');
+	url.searchParams.set('e', 'AI Assistant'); url.searchParams.set('ajax_action', 'test_service');
+	fetch(url.toString(), { method: 'POST', headers: { 'Content-Type': 'application/json; charset=UTF-8' },
+		body: JSON.stringify({ ajax: true, _csrf: context.csrf }) })
+		.then(function (r) { return r.json(); })
+		.then(function (d) { out.textContent = d.message; out.style.color = d.status === 'ok' ? '#22c55e' : '#ef4444'; })
+		.catch(function () { out.textContent = 'Request failed'; out.style.color = '#ef4444'; })
+		.finally(function () { btn.disabled = false; });
 });
 </script>

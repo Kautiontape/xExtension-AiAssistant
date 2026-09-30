@@ -1,8 +1,8 @@
 {
 	"name": "AI Assistant",
-	"author": "Shawn",
-	"description": "AI-powered article scoring, summaries, and interest profile management using Claude.",
-	"version": "1.0",
+	"author": "Shawn Squire",
+	"description": "Relevance scores, summaries and chat for entries, powered by the assistant service (Claude).",
+	"version": "2.0.0",
 	"entrypoint": "AiAssistant",
 	"type": "user"
 }
